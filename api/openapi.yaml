@@ -11,7 +11,7 @@ info:
 servers:
   - url: https://cloud-run-app-url.placeholder.url
     description: Cloud Run (production)
-  - url: http://localhost:8080/v1
+  - url: http://localhost:8080
     description: Local (development)
 
 paths:
