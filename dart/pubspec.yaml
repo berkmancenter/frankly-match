@@ -1,4 +1,4 @@
-name: frankly_matching
+name: frankly_match
 description: >-
   Diversity-maximizing group matching for deliberative conversations.
   Assigns participants into groups that maximise Hamming distance across
