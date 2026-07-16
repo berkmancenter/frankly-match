@@ -107,9 +107,10 @@ List<List<String>> groupMatch({
   final int clusterSize = numParticipants ~/ targetGroupSize;
   final int remainder = numParticipants - (clusterSize * targetGroupSize);
   final clusters = <List<String>>[];
-  print(
-      'numParticipants=${numParticipants}, targetGroupSize=${targetGroupSize}, clusterSize=${clusterSize}, remainder =${remainder}');
-
+  if (logclusters) {
+    print(
+        'numParticipants=${numParticipants}, targetGroupSize=${targetGroupSize}, clusterSize=${clusterSize}, remainder =${remainder}');
+  }
   for (int i = 0; i < targetGroupSize; i++) {
     if (i < remainder) {
       clusters.add(_getNextCluster(buckets, G, clusterSize + 1));
