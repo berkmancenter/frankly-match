@@ -22,6 +22,9 @@ List<List<String>> randomGroups(List<String> items, int targetGroupSize) {
   if (targetGroupSize <= 0) {
     throw ArgumentError('targetGroupSize must be greater than 0');
   }
+  if (items.length < targetGroupSize) {
+    return [List<String>.from(items)];
+  }
   items.shuffle();
   final groups = <List<String>>[];
   while (items.length >= targetGroupSize) {
