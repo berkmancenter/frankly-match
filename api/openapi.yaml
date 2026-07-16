@@ -35,7 +35,7 @@ paths:
       description: |
         Currently, accepts a map of participant IDs to binary answer strings and returns groups whose members have maximally different answer patterns (high Hamming distance).
 
-        Answer strings encode survey responses as `"0"`/`"1"` characters, one character per question (e.g. `"01001"`). The API treats these as opaque — all semantic meaning lives in the caller. Strings shorter than the maximum are random-padded server-side; strings longer than 9 characters are truncated to 9.
+        Answer strings encode survey responses as `"0"`/`"1"` characters, one character per question (e.g. `"01001"`). The API treats these as opaque — all semantic meaning lives in the caller. Strings shorter than the maximum are random-padded server-side.
 
         **`binaryGroupMatch` algorithm:**
         1. Create "buckets" of participants grouped by identical answer mask
@@ -191,8 +191,7 @@ components:
           description: |
             Binary string encoding survey responses as `"0"`/`"1"` characters, one per question (e.g. `"01001"`). Required by `binaryGroupMatch`.
 
-            Strings shorter than the longest mask in the request are
-            random-padded server-side; strings longer than 9 characters are truncated to 9.
+            Strings shorter than the longest mask in the request are random-padded server-side.
           example: "01001"
       additionalProperties: true
       example:
@@ -250,7 +249,6 @@ components:
           description: Machine-readable error identifier
           enum:
             - INVALID_ANSWER_MASK
-            - INCONSISTENT_MASK_LENGTH
             - NO_PARTICIPANTS
             - TARGET_GROUP_SIZE_TOO_SMALL
             - UNKNOWN_ALGORITHM
