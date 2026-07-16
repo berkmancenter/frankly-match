@@ -6,10 +6,10 @@ Code for the "smart matching" feature that is currently used by the Frankly plat
 
 Please visit https://github.com/berkmancenter/frankly-match for our repo, which also contains code for our hosted Frankly Match API. 
 
-## Contents
+## Repo Contents
 
 - `dart/` — [`frankly_match`](https://pub.dev/packages/frankly_match) pub.dev Dart package.
-- `api/` — Google Cloud Run service implementing the [match API](./openapi.yaml). Written in Python for research purposes.
+- `api/` — Google Cloud Run service implementing the match API. Written in Python for research purposes.
 
 ## Description
 
