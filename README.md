@@ -1,12 +1,12 @@
 # Frankly Match
 
-This directory is home to Frankly's matching feature. Frankly Match is an ongoing research and engineering effort to develop ways to match people in interesting, generative, diverse, or other ways to facilitate constructive dialogue.
+Frankly Match is an ongoing research and engineering effort to develop ways to match people in interesting, generative, diverse, or other ways to facilitate constructive dialogue.
 
-Code for the "smart matching" feature that is currently used by Frankly lives here. We welcome contributions, forks, comments, issues, etc. from the community. Thanks for stopping by!
+Code for the "smart matching" feature that is currently used by the Frankly platform lives here. We welcome contributions, forks, comments, issues, etc. from the community. Thanks for stopping by!
 
 ## Contents
 
-- `dart/` — [`frankly_matching`](https://pub.dev/packages/frankly_matching) pub.dev Dart package.
+- `dart/` — [`frankly_match`](https://pub.dev/packages/frankly_match) pub.dev Dart package.
 - `api/` — Google Cloud Run service implementing the [match API](./openapi.yaml). Written in Python for research purposes.
 
 ## Description
