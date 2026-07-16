@@ -1,6 +1,6 @@
 # Frankly Match
 
-Frankly Match is an ongoing research and engineering effort to develop ways to match people in interesting, generative, diverse, or other ways to facilitate constructive dialogue.
+Frankly Match is an ongoing research and engineering effort to develop the most effective ways to match people into groups for facilitating constructive dialogue.
 
 Code for the "smart matching" feature that is currently used by the Frankly platform lives here. We welcome contributions, forks, comments, issues, etc. from the community. Thanks for stopping by!
 
