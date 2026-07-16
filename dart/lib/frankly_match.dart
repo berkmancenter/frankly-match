@@ -19,6 +19,9 @@ const _idealDistance = 4;
 /// Assigns [items] into random groups of [targetGroupSize]. No survey data
 /// required. Mutates [items] in place.
 List<List<String>> randomGroups(List<String> items, int targetGroupSize) {
+  if (targetGroupSize <= 0) {
+    throw ArgumentError('targetGroupSize must be greater than 0');
+  }
   items.shuffle();
   final groups = <List<String>>[];
   while (items.length >= targetGroupSize) {
