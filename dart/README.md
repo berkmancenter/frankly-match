@@ -21,4 +21,31 @@ Each participant's survey answers are encoded as a binary string (`"01001"` = on
 - **`groupMatch`** — for groups of 3+. BFS-clusters by similarity, then composes groups by taking one member from each cluster.
 - **`randomGroups`** — no survey data needed. Random assignment baseline.
 
-We aim to develop other matching algorithms which may optimize for different heuristics (e.g. maximizing similarity, or creating other interesting configurations). We are also interested in expanding the diversity-matching algorithm to allow it to ingest and factor in more than simple binary answers (e.g. text, multiple-choice, drawings?!). 
+We aim to develop other matching algorithms which may optimize for different heuristics (e.g. maximizing similarity, or creating other interesting configurations). We are also interested in expanding the diversity-matching algorithm to allow it to ingest and factor in more than simple binary answers (e.g. text, multiple-choice, drawings?!).
+
+## Usage
+
+```dart
+import 'package:frankly_match/frankly_match.dart';
+
+// Participants mapped to their binary answer masks
+final responses = {
+  'alice': '01001',
+  'bob':   '10110',
+  'carol': '01010',
+  'dave':  '11001',
+};
+
+// Match into pairs maximising Hamming distance
+final pairs = bucketMatch(samples: responses);
+// => [['bob', 'alice'], ['dave', 'carol']]
+
+// Match into groups of 3
+final groups = groupMatch(participantResponses: responses, targetGroupSize: 3);
+// => [['alice', 'bob', 'carol'], ['dave', ...]]
+
+// Random groups (no survey data needed)
+final ids = responses.keys.toList();
+final random = randomGroups(ids, 2);
+// => [['alice', 'bob'], ['carol', 'dave']]
+``` 
