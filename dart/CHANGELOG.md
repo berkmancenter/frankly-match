@@ -1,3 +1,6 @@
+## 0.1.1
+Update README to include Usage section.
+
 ## 0.1.0
 
 Initial pub.dev release of the Frankly Match diversity matching algorithm!
