@@ -71,7 +71,7 @@ paths:
                     uid_frank:
                       binaryAnswerMask: "11000"
               threeGroupsWithExtras:
-                summary: 6 participants with extra data fields (hypothetical)
+                summary: 3 participants with extra data fields (hypothetical)
                 value:
                   algorithm: binaryGroupMatch
                   targetGroupSize: 3
@@ -119,14 +119,19 @@ paths:
                 result:
                   value:
                     results:
-                      - participantIds: ["uid_alice", "uid_dave", "uid_eve"]
-                      - participantIds: ["uid_bob", "uid_carol", "uid_frank"]
-                resultWithGroupPrompt:
+                      - groupId: "1"
+                        participantIds: ["uid_alice", "uid_dave", "uid_eve"]
+                      - groupId: "2"
+                        participantIds: ["uid_bob", "uid_carol", "uid_frank"]
+                resultWithReflectionPrompt:
+                  summary: Hypothetical future response with per-group reflection prompt
                   value:
                     results:
-                      - participantIds: ["uid_alice", "uid_dave", "uid_eve"]
+                      - groupId: "1"
+                        participantIds: ["uid_alice", "uid_dave", "uid_eve"]
                         reflectionPrompt: "Consider how different perspectives on this topic might apply to your group."
-                      - participantIds: ["uid_bob", "uid_carol", "uid_frank"]
+                      - groupId: "2"
+                        participantIds: ["uid_bob", "uid_carol", "uid_frank"]
                         reflectionPrompt: "Think about what common ground exists despite different views."
         "400":
           $ref: "#/components/responses/BadRequest"
@@ -205,20 +210,24 @@ components:
         results:
           type: array
           description: |
-            List of group result objects. Every input participantId appears in exactly one group. Each object contains at minimum `groupId` and `participantIds`; additional keys may be present depending on the algorithm (e.g `reflectionPrompt`). Callers should treat unknown keys as optional enrichment and ignore them if not needed.
+            List of group result objects. Every input participantId appears in exactly one group.
           minItems: 1
           items:
             $ref: "#/components/schemas/GroupResult"
           example:
-            - groupId: "1a"
+            - groupId: "1"
               participantIds: ["uid_alice", "uid_dave"]
-            - groupId: "2b"
+            - groupId: "2"
               participantIds: ["uid_bob", "uid_carol"]
 
     GroupResult:
       type: object
-      required: [participantIds]
+      required: [groupId, participantIds]
       properties:
+        groupId:
+          type: string
+          description: Stable identifier for this group within the response.
+          example: "1"
         participantIds:
           type: array
           minItems: 1
@@ -228,7 +237,7 @@ components:
           example: ["uid_alice", "uid_dave", "uid_eve"]
       additionalProperties: true
       description: |
-        A single group result. `participantIds` is the only required key.
+        A single group result. `groupId` and `participantIds` are always present.
 
         Algorithms may attach arbitrary additional keys (e.g. `reflectionPrompt`, `diversityScore`) — app developers should treat these as optional.
 
