@@ -16,14 +16,28 @@ import 'dart:math';
 const _minDistance = 3;
 const _idealDistance = 4;
 
+/// A matched group returned by Frankly Match algorithms.
+class MatchGroup {
+  final String id;
+  final List<String> participantIds;
+
+  const MatchGroup(this.id, this.participantIds);
+}
+
+String _id(int index, List<String>? groupIds) =>
+    (groupIds != null && index < groupIds.length)
+        ? groupIds[index]
+        : '${index + 1}';
+
 /// Assigns [items] into random groups of [targetGroupSize]. No survey data
 /// required. Mutates [items] in place.
-List<List<String>> randomGroups(List<String> items, int targetGroupSize) {
+List<MatchGroup> randomGroups(List<String> items, int targetGroupSize,
+    {List<String>? groupIds}) {
   if (targetGroupSize <= 0) {
     throw ArgumentError('targetGroupSize must be greater than 0');
   }
   if (items.length < targetGroupSize) {
-    return [List<String>.from(items)];
+    return [MatchGroup(_id(0, groupIds), List<String>.from(items))];
   }
   items.shuffle();
   final groups = <List<String>>[];
@@ -35,7 +49,10 @@ List<List<String>> randomGroups(List<String> items, int targetGroupSize) {
   for (var i = 0; i < r; i++) {
     groups[i % groups.length].add(items.removeLast());
   }
-  return groups;
+  return [
+    for (var i = 0; i < groups.length; i++)
+      MatchGroup(_id(i, groupIds), groups[i])
+  ];
 }
 
 /// Matches participants into pairs or small groups, maximizing the direct
@@ -51,10 +68,11 @@ List<List<String>> randomGroups(List<String> items, int targetGroupSize) {
 ///
 /// The response is lists with user IDs that have been matched.
 ///
-List<List<String>> bucketMatch({
+List<MatchGroup> bucketMatch({
   required Map<String, String> samples,
   int idealDistance = _idealDistance,
   int minDistance = _minDistance,
+  List<String>? groupIds,
 }) {
   // Match samples into pairs.  If odd, last pair will be a singleton.
   final pairs = <List<String>>[];
@@ -80,8 +98,10 @@ List<List<String>> bucketMatch({
   if (unmatchedUsers.isNotEmpty) {
     pairs.add(unmatchedUsers);
   }
-
-  return pairs;
+  return [
+    for (var i = 0; i < pairs.length; i++)
+      MatchGroup(_id(i, groupIds), pairs[i])
+  ];
 }
 
 /// Creates diversity-maximised groups by first using BFS clustering to create
@@ -95,9 +115,10 @@ List<List<String>> bucketMatch({
 /// - [targetGroupSize]: desired participants per group (≥ 2)
 /// - [logclusters]: Whether to print cluster debug info
 ///
-List<List<String>> groupMatch({
+List<MatchGroup> groupMatch({
   required Map<String, String> participantResponses,
   required int targetGroupSize,
+  List<String>? groupIds,
   bool logclusters = false,
 }) {
   final buckets = _bucketSamples(participantResponses);
@@ -107,7 +128,7 @@ List<List<String>> groupMatch({
   // Return simple value if not enough participants or single participant.
   final numParticipants = participantResponses.length;
   if (numParticipants <= targetGroupSize || numParticipants <= 1) {
-    return [participantResponses.keys.toList()];
+    return [MatchGroup(_id(0, groupIds), participantResponses.keys.toList())];
   }
 
   final int clusterSize = numParticipants ~/ targetGroupSize;
@@ -141,7 +162,10 @@ List<List<String>> groupMatch({
     // Remainders are added as extras to existing groups
     groups[i % groups.length].add(clusters[i].removeLast());
   }
-  return groups;
+  return [
+    for (var i = 0; i < groups.length; i++)
+      MatchGroup(_id(i, groupIds), groups[i])
+  ];
 }
 
 /// *** HELPER/UTIL METHODS ***

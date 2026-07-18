@@ -3,7 +3,7 @@ description: >-
   Diversity-maximizing group matching for deliberative conversations.
   Assigns participants into groups that maximise Hamming distance across
   answer masks, ensuring each group contains heterogeneous viewpoints.
-version: 0.1.1
+version: 0.2.0
 repository: https://github.com/berkmancenter/frankly/tree/main/matching/dart
 issue_tracker: https://github.com/berkmancenter/frankly/issues
 topics:

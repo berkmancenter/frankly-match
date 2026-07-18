@@ -1,3 +1,15 @@
+## 0.2.0
+
+**Breaking change**: all three public functions now return `List<MatchGroup>` instead of `List<List<String>>`.
+
+`MatchGroup` is a new class with two fields:
+- `id` — string identifier for the group within a single match call
+- `participantIds` — the list of participant IDs (previously the inner list)
+
+Migration: replace uses of the return value as `List<List<String>>` with `.map((g) => g.participantIds)` where needed, and use `g.id` to access the group identifier.
+
+This change aligns the Dart package's return shape with the HTTP API (`groupId` + `participantIds`), allowing consuming apps to treat both interchangeably.
+
 ## 0.1.1
 Update README to include Usage section.
 
