@@ -38,14 +38,24 @@ final responses = {
 
 // Match into pairs maximising Hamming distance
 final pairs = bucketMatch(samples: responses);
-// => [['bob', 'alice'], ['dave', 'carol']]
+for (final group in pairs) {
+  print('Group ${group.id}: ${group.participantIds}');
+}
+// Group 1: [bob, alice]
+// Group 2: [dave, carol]
 
 // Match into groups of 3
 final groups = groupMatch(participantResponses: responses, targetGroupSize: 3);
-// => [['alice', 'bob', 'carol'], ['dave', ...]]
+// groups[0].id => '1', groups[0].participantIds => ['alice', 'bob', 'carol']
+
+// Optionally supply your own group IDs (e.g. pre-generated Firestore document IDs)
+final groups2 = groupMatch(
+  participantResponses: responses,
+  targetGroupSize: 3,
+  groupIds: ['room_abc', 'room_xyz'],
+);
 
 // Random groups (no survey data needed)
-final ids = responses.keys.toList();
-final random = randomGroups(ids, 2);
-// => [['alice', 'bob'], ['carol', 'dave']]
+final random = randomGroups(responses.keys.toList(), 2);
+// random[0].id => '1', random[0].participantIds => ['alice', 'bob']
 ``` 
