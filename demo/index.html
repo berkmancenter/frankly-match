@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Frankly Match — Demo</title>
+    <style>
+        body {
+            font-family: system-ui, sans-serif;
+            max-width: 600px;
+            margin: 60px auto;
+            padding: 0 24px;
+            color: #1a1a1a;
+        }
+
+        h1 {
+            font-size: 1.4rem;
+            margin-bottom: 4px;
+        }
+
+        p.sub {
+            color: #666;
+            margin: 0 0 24px;
+            font-size: 0.9rem;
+        }
+
+        .presets-label {
+            font-size: 0.75rem;
+            font-weight: 700;
+            color: #aaa;
+            text-transform: uppercase;
+            letter-spacing: .06em;
+            margin-bottom: 8px;
+        }
+
+        .presets {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-bottom: 16px;
+        }
+
+        .preset-btn {
+            background: #eee;
+            color: #1a1a1a;
+            border: 2px solid transparent;
+            border-radius: 8px;
+            padding: 6px 14px;
+            font-size: 0.85rem;
+            cursor: pointer;
+            margin-bottom: 0;
+        }
+
+        .preset-btn:hover {
+            background: #ddd;
+        }
+
+        .preset-btn.active {
+            border-color: #1a1a1a;
+            background: #fff;
+        }
+
+        .preset-desc {
+            font-size: 0.82rem;
+            color: #888;
+            margin: 0 0 20px;
+            min-height: 1.2em;
+        }
+
+        .custom-controls {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            margin-bottom: 24px;
+        }
+
+        .custom-person {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            background: #f5f5f5;
+            border-radius: 10px;
+            padding: 10px 14px;
+        }
+
+        .custom-person input[type="text"] {
+            font-family: inherit;
+            font-size: 0.9rem;
+            font-weight: 700;
+            border: none;
+            background: transparent;
+            width: 70px;
+            outline: none;
+            color: #1a1a1a;
+        }
+
+        .dot-toggle {
+            width: 18px;
+            height: 18px;
+            border-radius: 50%;
+            border: none;
+            cursor: pointer;
+            padding: 0;
+            flex-shrink: 0;
+            transition: transform 0.1s;
+        }
+
+        .dot-toggle:hover {
+            transform: scale(1.25);
+        }
+
+        .remove-person {
+            margin-left: auto;
+            background: none;
+            border: none;
+            color: #ccc;
+            font-size: 1.1rem;
+            cursor: pointer;
+            padding: 0 4px;
+            line-height: 1;
+            margin-bottom: 0;
+        }
+
+        .remove-person:hover {
+            color: #c00;
+            background: none;
+        }
+
+        .custom-footer {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            flex-wrap: wrap;
+            margin-top: 4px;
+        }
+
+        .add-person-btn {
+            background: #eee;
+            color: #555;
+            border: 2px dashed #ccc;
+            border-radius: 8px;
+            padding: 7px 14px;
+            font-size: 0.85rem;
+            cursor: pointer;
+            margin-bottom: 0;
+        }
+
+        .add-person-btn:hover {
+            background: #e4e4e4;
+        }
+
+        .group-size-control {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.85rem;
+            color: #555;
+        }
+
+        .group-size-control button {
+            width: 26px;
+            height: 26px;
+            padding: 0;
+            font-size: 1rem;
+            border-radius: 6px;
+            margin-bottom: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .group-size-val {
+            font-weight: 700;
+            font-size: 1rem;
+            min-width: 16px;
+            text-align: center;
+        }
+
+        .match-btn {
+            background: #1a1a1a;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            padding: 12px 28px;
+            font-size: 1rem;
+            cursor: pointer;
+            margin-bottom: 28px;
+        }
+
+        .match-btn:hover {
+            background: #333;
+        }
+
+        .match-btn:disabled {
+            background: #bbb;
+            cursor: default;
+        }
+
+        .groups {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .group {
+            background: #f5f5f5;
+            border-radius: 10px;
+            padding: 14px 18px;
+        }
+
+        .group-label {
+            font-size: 0.75rem;
+            font-weight: 700;
+            color: #888;
+            text-transform: uppercase;
+            letter-spacing: .06em;
+            margin-bottom: 10px;
+        }
+
+        .group-members {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+
+        .person {
+            background: #e8e8e8;
+            border-radius: 10px;
+            padding: 10px 14px;
+            text-align: center;
+            min-width: 80px;
+        }
+
+        .person strong {
+            display: block;
+            margin-bottom: 7px;
+            font-size: 0.85rem;
+        }
+
+        .dots {
+            display: flex;
+            gap: 5px;
+            justify-content: center;
+        }
+
+        .dot {
+            width: 11px;
+            height: 11px;
+            border-radius: 50%;
+        }
+
+        .error {
+            color: #c00;
+            font-size: 0.9rem;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>Frankly Match</h1>
+    <p class="sub">
+        Each person has answered 5 yes/no questions.
+        <span style="color:#4f86c6">&#9679;</span> = Yes &nbsp;
+        <span style="color:#e07b54">&#9679;</span> = No &nbsp;&mdash;&nbsp;
+        click any dot to flip it, add or remove people, then hit Match.
+    </p>
+
+    <div class="presets-label">Load a preset</div>
+    <div class="presets">
+        <button class="preset-btn" onclick="loadPreset(0)">Clear split</button>
+        <button class="preset-btn" onclick="loadPreset(1)">Nuanced spread</button>
+        <button class="preset-btn" onclick="loadPreset(2)">Groups of 3</button>
+    </div>
+    <p class="preset-desc" id="preset-desc"></p>
+
+    <div class="custom-controls" id="custom-controls"></div>
+
+    <button class="match-btn" id="btn" onclick="runMatch()">Match!</button>
+    <div id="output"></div>
+
+    <script>
+        const API_URL = "https://frankly-match-gateway-aputzq6q.uc.gateway.dev/match";
+        const API_KEY = "FRANKLY_MATCH_API_KEY";
+        const NUM_QUESTIONS = 5;
+
+        const PRESETS = [
+            {
+                desc: "Half the group agrees on everything, half disagrees on everything.",
+                groupSize: 2,
+                people: [
+                    { name: "Alex", mask: "00000" },
+                    { name: "Jordan", mask: "11111" },
+                    { name: "Morgan", mask: "00000" },
+                    { name: "Taylor", mask: "11111" },
+                    { name: "Casey", mask: "00000" },
+                    { name: "Riley", mask: "11111" },
+                    { name: "Quinn", mask: "00000" },
+                    { name: "Avery", mask: "11111" },
+                ]
+            },
+            {
+                desc: "Everyone holds a unique mix of views — no two people alike.",
+                groupSize: 2,
+                people: [
+                    { name: "Alex", mask: "00000" },
+                    { name: "Jordan", mask: "11111" },
+                    { name: "Morgan", mask: "01010" },
+                    { name: "Taylor", mask: "10101" },
+                    { name: "Casey", mask: "00111" },
+                    { name: "Riley", mask: "11000" },
+                    { name: "Quinn", mask: "01101" },
+                    { name: "Avery", mask: "10010" },
+                ]
+            },
+            {
+                desc: "9 people matched into trios. Try switching to group size 2 to compare.",
+                groupSize: 3,
+                people: [
+                    { name: "Alex", mask: "00000" },
+                    { name: "Jordan", mask: "11111" },
+                    { name: "Morgan", mask: "01010" },
+                    { name: "Taylor", mask: "10101" },
+                    { name: "Casey", mask: "00111" },
+                    { name: "Riley", mask: "11000" },
+                    { name: "Quinn", mask: "01101" },
+                    { name: "Avery", mask: "10010" },
+                    { name: "Skyler", mask: "11010" },
+                ]
+            },
+        ];
+
+        let people = [
+            { name: "Alex", mask: "01001" },
+            { name: "Jordan", mask: "10110" },
+            { name: "Morgan", mask: "00111" },
+            { name: "Taylor", mask: "11000" },
+            { name: "Casey", mask: "01110" },
+            { name: "Riley", mask: "10001" },
+        ];
+        let groupSize = 2;
+
+        function render() {
+            const el = document.getElementById("custom-controls");
+            el.innerHTML = people.map((p, pi) =>
+                '<div class="custom-person">' +
+                '<input type="text" value="' + p.name + '" onchange="people[' + pi + '].name = this.value" maxlength="12" />' +
+                '<div class="dots" style="gap:6px">' +
+                p.mask.split("").map((b, qi) =>
+                    '<button class="dot-toggle" style="background:' + (b === "0" ? "#4f86c6" : "#e07b54") + '" ' +
+                    'title="Q' + (qi + 1) + ': click to toggle" onclick="toggleDot(' + pi + ',' + qi + ')"></button>'
+                ).join("") +
+                '</div>' +
+                '<button class="remove-person" title="Remove" onclick="removePerson(' + pi + ')">&#10005;</button>' +
+                '</div>'
+            ).join("") +
+                '<div class="custom-footer">' +
+                '<button class="add-person-btn" onclick="addPerson()">+ Add person</button>' +
+                '<div class="group-size-control">Group size:' +
+                '<button onclick="changeGroupSize(-1)">&minus;</button>' +
+                '<span class="group-size-val" id="gs-val">' + groupSize + '</span>' +
+                '<button onclick="changeGroupSize(1)">+</button>' +
+                '</div>' +
+                '</div>';
+        }
+
+        function toggleDot(pi, qi) {
+            const bits = people[pi].mask.split("");
+            bits[qi] = bits[qi] === "0" ? "1" : "0";
+            people[pi].mask = bits.join("");
+            render();
+        }
+
+        function addPerson() {
+            const names = ["Sam", "Drew", "Jamie", "Reese", "Blair", "Finley", "River", "Sage", "Parker", "Emery"];
+            const used = people.map(p => p.name);
+            const name = names.find(n => !used.includes(n)) || ("P" + (people.length + 1));
+            const mask = Array.from({ length: NUM_QUESTIONS }, () => Math.random() > 0.5 ? "1" : "0").join("");
+            people.push({ name, mask });
+            render();
+        }
+
+        function removePerson(pi) {
+            if (people.length <= 2) return;
+            people.splice(pi, 1);
+            groupSize = Math.min(groupSize, people.length);
+            render();
+        }
+
+        function changeGroupSize(delta) {
+            groupSize = Math.max(2, Math.min(people.length, groupSize + delta));
+            document.getElementById("gs-val").textContent = groupSize;
+        }
+
+        function loadPreset(i) {
+            people = PRESETS[i].people.map(p => ({ name: p.name, mask: p.mask }));
+            groupSize = PRESETS[i].groupSize;
+            document.getElementById("preset-desc").textContent = PRESETS[i].desc;
+            document.querySelectorAll(".preset-btn").forEach(function (b, j) {
+                b.classList.toggle("active", i === j);
+            });
+            document.getElementById("output").innerHTML = "";
+            render();
+        }
+
+        function dots(mask) {
+            return mask.split("").map((b, i) =>
+                '<div class="dot" style="background:' + (b === "0" ? "#4f86c6" : "#e07b54") + '" title="Q' + (i + 1) + ': ' + (b === "0" ? "Yes" : "No") + '"></div>'
+            ).join("");
+        }
+
+        render();
+
+        async function runMatch() {
+            const btn = document.getElementById("btn");
+            const out = document.getElementById("output");
+            btn.disabled = true; btn.textContent = "Matching\u2026";
+            out.innerHTML = "";
+
+            const snapshot = people.map(p => ({ name: p.name, mask: p.mask }));
+            const gs = groupSize;
+
+            try {
+                const res = await fetch(API_URL, {
+                    method: "POST",
+                    headers: { "x-api-key": API_KEY, "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        algorithm: "binaryGroupMatch",
+                        targetGroupSize: gs,
+                        participants: Object.fromEntries(snapshot.map(p => [p.name, { binaryAnswerMask: p.mask }]))
+                    })
+                });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.message || res.statusText);
+
+                out.innerHTML = '<div class="groups">' + data.results.map(g =>
+                    '<div class="group">' +
+                    '<div class="group-label">Group ' + g.groupId + '</div>' +
+                    '<div class="group-members">' +
+                    g.participantIds.map(id => {
+                        const p = snapshot.find(x => x.name === id);
+                        return '<div class="person"><strong>' + p.name + '</strong><div class="dots">' + dots(p.mask) + '</div></div>';
+                    }).join("") +
+                    '</div>' +
+                    '</div>'
+                ).join("") + '</div>';
+            } catch (e) {
+                out.innerHTML = '<p class="error">Error: ' + e.message + '</p>';
+            } finally {
+                btn.disabled = false; btn.textContent = "Match!";
+            }
+        }
+    </script>
+</body>
+
+</html>
