@@ -3,6 +3,8 @@ name: Deploy demo to GitHub Pages
 on:
     push:
         branches: [main]
+        paths:
+            - demo/index.html
     workflow_dispatch:
 
 permissions:
