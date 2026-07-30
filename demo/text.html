@@ -1,0 +1,662 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Frankly Match — Text Matching Demo</title>
+    <style>
+        :root {
+            color-scheme: light;
+            --ink: #17211b;
+            --muted: #647069;
+            --line: #dce3de;
+            --panel: #f6f8f6;
+            --accent: #176b45;
+            --accent-dark: #0f5335;
+            --low: #4467a7;
+            --medium: #a06c16;
+            --high: #9b3f48;
+            --unknown: #626a66;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            background: #eef2ef;
+            color: var(--ink);
+            font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        }
+
+        main {
+            width: min(1100px, calc(100% - 32px));
+            margin: 36px auto 72px;
+        }
+
+        .hero,
+        .workspace,
+        .results-panel {
+            background: white;
+            border: 1px solid var(--line);
+            border-radius: 18px;
+            box-shadow: 0 12px 36px rgba(27, 45, 34, 0.07);
+        }
+
+        .hero {
+            padding: 28px;
+            margin-bottom: 18px;
+        }
+
+        .eyebrow {
+            color: var(--accent);
+            font-size: 0.76rem;
+            font-weight: 800;
+            letter-spacing: 0.1em;
+            margin: 0 0 8px;
+            text-transform: uppercase;
+        }
+
+        h1,
+        h2,
+        p {
+            margin-top: 0;
+        }
+
+        h1 {
+            font-size: clamp(1.8rem, 4vw, 2.7rem);
+            letter-spacing: -0.04em;
+            margin-bottom: 10px;
+        }
+
+        h2 {
+            font-size: 1.1rem;
+            margin-bottom: 4px;
+        }
+
+        .hero p,
+        .section-copy {
+            color: var(--muted);
+            line-height: 1.55;
+            margin-bottom: 0;
+        }
+
+        .workspace,
+        .results-panel {
+            padding: 24px;
+        }
+
+        .toolbar {
+            align-items: end;
+            display: grid;
+            gap: 14px;
+            grid-template-columns: minmax(260px, 1fr) 150px auto;
+            margin: 22px 0;
+        }
+
+        label {
+            color: var(--muted);
+            display: block;
+            font-size: 0.76rem;
+            font-weight: 800;
+            letter-spacing: 0.04em;
+            margin-bottom: 6px;
+            text-transform: uppercase;
+        }
+
+        input,
+        textarea,
+        button {
+            font: inherit;
+        }
+
+        input,
+        textarea {
+            background: white;
+            border: 1px solid #cbd5ce;
+            border-radius: 9px;
+            color: var(--ink);
+            outline: none;
+            padding: 10px 12px;
+            width: 100%;
+        }
+
+        input:focus,
+        textarea:focus {
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px rgba(23, 107, 69, 0.12);
+        }
+
+        textarea {
+            min-height: 74px;
+            resize: vertical;
+        }
+
+        button {
+            background: var(--accent);
+            border: 0;
+            border-radius: 9px;
+            color: white;
+            cursor: pointer;
+            font-weight: 750;
+            padding: 11px 16px;
+        }
+
+        button:hover {
+            background: var(--accent-dark);
+        }
+
+        button:disabled {
+            cursor: wait;
+            opacity: 0.55;
+        }
+
+        button.secondary {
+            background: #e7ece8;
+            color: var(--ink);
+        }
+
+        button.secondary:hover {
+            background: #dbe3dd;
+        }
+
+        button.remove {
+            align-self: start;
+            background: transparent;
+            color: #9b3f48;
+            padding: 8px 4px;
+        }
+
+        .participants {
+            display: grid;
+            gap: 10px;
+        }
+
+        .participant {
+            align-items: start;
+            background: var(--panel);
+            border: 1px solid #e4e9e5;
+            border-radius: 12px;
+            display: grid;
+            gap: 12px;
+            grid-template-columns: 150px minmax(250px, 1fr) 60px;
+            padding: 13px;
+        }
+
+        .actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-top: 16px;
+        }
+
+        .status {
+            border-radius: 10px;
+            display: none;
+            line-height: 1.45;
+            margin-top: 18px;
+            padding: 12px 14px;
+        }
+
+        .status.visible {
+            display: block;
+        }
+
+        .status.info {
+            background: #edf5f0;
+            color: var(--accent-dark);
+        }
+
+        .status.error {
+            background: #fff0f1;
+            color: #8a2731;
+        }
+
+        .results-panel {
+            display: none;
+            margin-top: 18px;
+        }
+
+        .results-panel.visible {
+            display: block;
+        }
+
+        .results-grid {
+            display: grid;
+            gap: 14px;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            margin-top: 18px;
+        }
+
+        .group {
+            border: 1px solid var(--line);
+            border-top: 5px solid var(--unknown);
+            border-radius: 12px;
+            overflow: hidden;
+        }
+
+        .group[data-level="low"] {
+            border-top-color: var(--low);
+        }
+
+        .group[data-level="medium"] {
+            border-top-color: var(--medium);
+        }
+
+        .group[data-level="high"] {
+            border-top-color: var(--high);
+        }
+
+        .group-header {
+            align-items: center;
+            display: flex;
+            justify-content: space-between;
+            padding: 14px 16px 8px;
+        }
+
+        .group-title {
+            font-size: 1rem;
+            font-weight: 850;
+        }
+
+        .tier {
+            border-radius: 999px;
+            color: white;
+            font-size: 0.7rem;
+            font-weight: 850;
+            letter-spacing: 0.06em;
+            padding: 5px 9px;
+            text-transform: uppercase;
+        }
+
+        .tier.low {
+            background: var(--low);
+        }
+
+        .tier.medium {
+            background: var(--medium);
+        }
+
+        .tier.high {
+            background: var(--high);
+        }
+
+        .tier.unknown {
+            background: var(--unknown);
+        }
+
+        .members {
+            display: grid;
+            gap: 8px;
+            padding: 8px 16px 14px;
+        }
+
+        .member {
+            background: var(--panel);
+            border-radius: 8px;
+            padding: 9px 10px;
+        }
+
+        .member strong {
+            display: block;
+            font-size: 0.84rem;
+            margin-bottom: 3px;
+        }
+
+        .member span {
+            color: var(--muted);
+            display: block;
+            font-size: 0.78rem;
+            line-height: 1.35;
+        }
+
+        .diffusion {
+            background: #eef4f0;
+            border-top: 1px solid var(--line);
+            color: #31443a;
+            font-size: 0.84rem;
+            line-height: 1.45;
+            margin: 0;
+            padding: 13px 16px 15px;
+        }
+
+        .diagnostics {
+            border-top: 1px solid var(--line);
+            color: var(--muted);
+            font-size: 0.75rem;
+            line-height: 1.45;
+            margin: 0;
+            padding: 10px 16px;
+        }
+
+        .diffusion strong {
+            display: block;
+            font-size: 0.7rem;
+            letter-spacing: 0.06em;
+            margin-bottom: 4px;
+            text-transform: uppercase;
+        }
+
+        .fallback {
+            color: #9b3f48;
+            font-size: 0.75rem;
+            font-weight: 800;
+            margin: 0;
+            padding: 0 16px 12px;
+        }
+
+        @media (max-width: 720px) {
+            main {
+                margin-top: 16px;
+                width: min(100% - 20px, 1100px);
+            }
+
+            .toolbar,
+            .participant {
+                grid-template-columns: 1fr;
+            }
+
+            button.remove {
+                justify-self: start;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <main>
+        <section class="hero">
+            <p class="eyebrow">Local development tester</p>
+            <h1>Text-based deliberation matching</h1>
+            <p>
+                Edit the sample responses, choose a target size, and call
+                <code>textGroupMatch</code>. Twelve participants at size four produce
+                one low-, one medium-, and one high-diversity group.
+            </p>
+        </section>
+
+        <section class="workspace">
+            <h2>Participants</h2>
+            <p class="section-copy">These are dummy statements intended only for endpoint testing.</p>
+
+            <div class="toolbar">
+                <div>
+                    <label for="api-url">API URL</label>
+                    <input id="api-url" type="url" />
+                </div>
+                <div>
+                    <label for="group-size">Target group size</label>
+                    <input id="group-size" type="number" min="3" value="4" />
+                </div>
+                <button id="match-button" type="button">Run text match</button>
+            </div>
+
+            <div class="participants" id="participants"></div>
+
+            <div class="actions">
+                <button class="secondary" id="add-button" type="button">Add participant</button>
+                <button class="secondary" id="reset-button" type="button">Reset sample</button>
+            </div>
+
+            <div class="status" id="status" role="status"></div>
+        </section>
+
+        <section class="results-panel" id="results-panel">
+            <h2>Match results</h2>
+            <p class="section-copy" id="result-summary"></p>
+            <div class="results-grid" id="results"></div>
+        </section>
+    </main>
+
+    <script>
+        const SAMPLE_PEOPLE = [
+            { id: "Alex", response: "Public transit should be free in major cities." },
+            { id: "Jordan", response: "Transit fares are necessary to maintain reliable service." },
+            { id: "Morgan", response: "Cities should build substantially more dense housing." },
+            { id: "Taylor", response: "Neighborhoods should retain local control over housing development." },
+            { id: "Casey", response: "Carbon taxes are the best way to reduce emissions." },
+            { id: "Riley", response: "Climate policy should prioritize direct public investment." },
+            { id: "Quinn", response: "University tuition should be publicly funded." },
+            { id: "Avery", response: "Students should contribute toward the cost of university." },
+            { id: "Skyler", response: "Voting should be mandatory in national elections." },
+            { id: "Drew", response: "Voting should remain a voluntary civic choice." },
+            { id: "Reese", response: "Healthcare should primarily use a public system." },
+            { id: "Blair", response: "Private healthcare options improve access and innovation." },
+        ];
+
+        const query = new URLSearchParams(window.location.search);
+        let people = cloneSample();
+        let nextParticipantNumber = 1;
+
+        const participantsElement = document.getElementById("participants");
+        const statusElement = document.getElementById("status");
+        const resultsPanel = document.getElementById("results-panel");
+        const resultsElement = document.getElementById("results");
+        const summaryElement = document.getElementById("result-summary");
+        const matchButton = document.getElementById("match-button");
+        const apiUrlInput = document.getElementById("api-url");
+        const groupSizeInput = document.getElementById("group-size");
+
+        apiUrlInput.value = query.get("api") || "http://127.0.0.1:8000/match";
+
+        document.getElementById("add-button").addEventListener("click", addParticipant);
+        document.getElementById("reset-button").addEventListener("click", resetSample);
+        matchButton.addEventListener("click", runMatch);
+
+        function cloneSample() {
+            return SAMPLE_PEOPLE.map((person) => ({ ...person }));
+        }
+
+        function renderParticipants() {
+            participantsElement.replaceChildren();
+            people.forEach((person, index) => {
+                const row = document.createElement("div");
+                row.className = "participant";
+
+                const idField = document.createElement("div");
+                const idLabel = document.createElement("label");
+                idLabel.textContent = "Participant ID";
+                const idInput = document.createElement("input");
+                idInput.type = "text";
+                idInput.value = person.id;
+                idInput.addEventListener("input", (event) => {
+                    people[index].id = event.target.value;
+                });
+                idField.append(idLabel, idInput);
+
+                const responseField = document.createElement("div");
+                const responseLabel = document.createElement("label");
+                responseLabel.textContent = "Free-form response";
+                const responseInput = document.createElement("textarea");
+                responseInput.value = person.response;
+                responseInput.addEventListener("input", (event) => {
+                    people[index].response = event.target.value;
+                });
+                responseField.append(responseLabel, responseInput);
+
+                const removeButton = document.createElement("button");
+                removeButton.className = "remove";
+                removeButton.type = "button";
+                removeButton.textContent = "Remove";
+                removeButton.addEventListener("click", () => {
+                    people.splice(index, 1);
+                    renderParticipants();
+                });
+
+                row.append(idField, responseField, removeButton);
+                participantsElement.append(row);
+            });
+        }
+
+        function addParticipant() {
+            people.push({
+                id: `Person ${nextParticipantNumber}`,
+                response: "Enter a free-form preference statement.",
+            });
+            nextParticipantNumber += 1;
+            renderParticipants();
+        }
+
+        function resetSample() {
+            people = cloneSample();
+            nextParticipantNumber = 1;
+            groupSizeInput.value = "4";
+            setStatus("", "");
+            resultsPanel.classList.remove("visible");
+            renderParticipants();
+        }
+
+        function validateInputs() {
+            const ids = people.map((person) => person.id.trim());
+            const groupSize = Number(groupSizeInput.value);
+            if (people.length < 3) {
+                throw new Error("Text matching requires at least three participants.");
+            }
+            if (!Number.isInteger(groupSize) || groupSize < 3) {
+                throw new Error("Target group size must be an integer of at least three.");
+            }
+            if (ids.some((id) => !id)) {
+                throw new Error("Every participant needs an ID.");
+            }
+            if (new Set(ids).size !== ids.length) {
+                throw new Error("Participant IDs must be unique.");
+            }
+            if (people.some((person) => !person.response.trim())) {
+                throw new Error("Every test participant needs a response.");
+            }
+            return groupSize;
+        }
+
+        async function runMatch() {
+            let groupSize;
+            try {
+                groupSize = validateInputs();
+            } catch (error) {
+                setStatus(error.message, "error");
+                return;
+            }
+
+            const snapshot = people.map((person) => ({
+                id: person.id.trim(),
+                response: person.response.trim(),
+            }));
+            const participants = Object.fromEntries(
+                snapshot.map((person) => [
+                    person.id,
+                    { freeTextResponse: person.response },
+                ])
+            );
+
+            matchButton.disabled = true;
+            matchButton.textContent = "Matching…";
+            resultsPanel.classList.remove("visible");
+            setStatus("Embedding responses and optimizing groups…", "info");
+            const started = performance.now();
+
+            try {
+                const response = await fetch(apiUrlInput.value.trim(), {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        algorithm: "textGroupMatch",
+                        targetGroupSize: groupSize,
+                        participants,
+                    }),
+                });
+                const data = await response.json();
+                if (!response.ok) {
+                    throw new Error(data.message || `API returned HTTP ${response.status}`);
+                }
+
+                const elapsedSeconds = ((performance.now() - started) / 1000).toFixed(2);
+                renderResults(data.results, snapshot, elapsedSeconds);
+                setStatus(`Matched ${snapshot.length} participants in ${elapsedSeconds} seconds.`, "info");
+            } catch (error) {
+                setStatus(`Request failed: ${error.message}`, "error");
+            } finally {
+                matchButton.disabled = false;
+                matchButton.textContent = "Run text match";
+            }
+        }
+
+        function renderResults(groups, snapshot, elapsedSeconds) {
+            resultsElement.replaceChildren();
+            summaryElement.textContent =
+                `${groups.length} groups returned in ${elapsedSeconds} seconds.`;
+
+            groups.forEach((group) => {
+                const card = document.createElement("article");
+                const level = group.diversityLevel || "unknown";
+                card.className = "group";
+                card.dataset.level = level;
+
+                const header = document.createElement("div");
+                header.className = "group-header";
+                const title = document.createElement("div");
+                title.className = "group-title";
+                title.textContent = `Group ${group.groupId}`;
+                const tier = document.createElement("span");
+                tier.className = `tier ${level}`;
+                tier.textContent = `${level} diversity`;
+                header.append(title, tier);
+
+                const members = document.createElement("div");
+                members.className = "members";
+                group.participantIds.forEach((participantId) => {
+                    const person = snapshot.find((candidate) => candidate.id === participantId);
+                    const member = document.createElement("div");
+                    member.className = "member";
+                    const name = document.createElement("strong");
+                    name.textContent = participantId;
+                    const response = document.createElement("span");
+                    response.textContent = person ? person.response : "Response unavailable";
+                    member.append(name, response);
+                    members.append(member);
+                });
+
+                const diffusion = document.createElement("p");
+                diffusion.className = "diffusion";
+                const diffusionLabel = document.createElement("strong");
+                diffusionLabel.textContent = "Diffusion statement";
+                diffusion.append(
+                    diffusionLabel,
+                    document.createTextNode(group.diffusionStatement || "Not returned")
+                );
+
+                const diagnostics = document.createElement("p");
+                diagnostics.className = "diagnostics";
+                diagnostics.textContent = [
+                    `Assigned target: ${formatScore(group.assignedTarget)}`,
+                    `Raw achieved: ${formatScore(group.achievedDiversity)}`,
+                    `Normalized achieved: ${formatScore(group.normalizedAchievedDiversity)}`,
+                ].join(" · ");
+
+                card.append(header, members, diagnostics, diffusion);
+                if (group.fallbackUsed) {
+                    const fallback = document.createElement("p");
+                    fallback.className = "fallback";
+                    fallback.textContent = "Fallback behavior was used for this group.";
+                    card.append(fallback);
+                }
+                resultsElement.append(card);
+            });
+
+            resultsPanel.classList.add("visible");
+        }
+
+        function setStatus(message, type) {
+            statusElement.textContent = message;
+            statusElement.className = message ? `status visible ${type}` : "status";
+        }
+
+        function formatScore(value) {
+            return Number.isFinite(value) ? Number(value).toFixed(3) : "not available";
+        }
+
+        renderParticipants();
+    </script>
+</body>
+
+</html>
