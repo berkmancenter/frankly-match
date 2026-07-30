@@ -8,13 +8,17 @@ info:
     name: Frankly / Berkman Klein Center
     url: https://github.com/berkmancenter/frankly
 
-host: cloud-run-app-url.placeholder.url
+host: frankly-match-gateway-aputzq6q.uc.gateway.dev
 basePath: /
 schemes:
   - https
 
 x-google-backend:
   address: https://frankly-match-api-euc2qc6jja-uc.a.run.app
+
+x-google-endpoints:
+  - name: frankly-match-gateway-aputzq6q.uc.gateway.dev
+    allowCors: true
 
 consumes:
   - application/json
@@ -43,6 +47,14 @@ paths:
             $ref: "#/definitions/HealthResponse"
 
   /match:
+    options:
+      operationId: matchCors
+      summary: CORS preflight
+      tags: [Matching]
+      security: []
+      responses:
+        "204":
+          description: CORS preflight response
     post:
       operationId: match
       summary: Match participants into discussion groups
