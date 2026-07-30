@@ -31,8 +31,9 @@ class MatchRequest(BaseModel):
     @field_validator("algorithm")
     @classmethod
     def check_algorithm(cls, v: str) -> str:
-        if v != "binaryGroupMatch":
-            raise ValueError(f"Unknown algorithm '{v}'. Supported: binaryGroupMatch")
+        supported = {"binaryGroupMatch"}
+        if v not in supported:
+            raise ValueError(f"Unknown algorithm '{v}'. Supported: {', '.join(sorted(supported))}")
         return v
 
     @field_validator("targetGroupSize")
@@ -113,7 +114,14 @@ def health():
 @app.post("/match", response_model=MatchResponse)
 def match(req: MatchRequest):
     samples = _normalize_masks(req.participants)
-    groups = group_match(samples, req.targetGroupSize)
+
+    if req.algorithm == "binaryGroupMatch":
+        groups = group_match(samples, req.targetGroupSize)
+    else:
+        # Unreachable — check_algorithm rejects unknown values first.
+        # Add new elif branches here as new algorithms are introduced.
+        return _error("UNKNOWN_ALGORITHM", f"Unknown algorithm '{req.algorithm}'", 400)
+
     return MatchResponse(results=[
         GroupResult(groupId=str(i + 1), participantIds=g)
         for i, g in enumerate(groups)
