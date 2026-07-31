@@ -3,7 +3,7 @@ info:
   title: Frankly Match API
   description: |
     Group matching algorithms for creating groups of participants in deliberations, in order to foster constructive dialogue.
-  version: 1.0.0
+  version: 1.2.0
   contact:
     name: Frankly / Berkman Klein Center
     url: https://github.com/berkmancenter/frankly
@@ -15,6 +15,7 @@ schemes:
 
 x-google-backend:
   address: https://frankly-match-api-euc2qc6jja-uc.a.run.app
+  deadline: 300.0
 
 x-google-endpoints:
   - name: frankly-match-gateway-aputzq6q.uc.gateway.dev
@@ -59,17 +60,28 @@ paths:
       operationId: match
       summary: Match participants into discussion groups
       description: |
-        Currently, accepts a map of participant IDs to binary answer strings and returns groups whose members have maximally different answer patterns (high Hamming distance).
-
-        Answer strings encode survey responses as "0"/"1" characters, one character per question (e.g. "01001"). The API treats these as opaque - all semantic meaning lives in the caller. Strings shorter than the maximum are random-padded server-side.
+        Accepts a map of participant IDs to survey responses and selects a matching strategy using the algorithm field.
 
         **binaryGroupMatch algorithm:**
+        Binary answer strings encode survey responses as "0"/"1" characters, one character per question (e.g. "01001"). Strings shorter than the maximum are random-padded server-side.
+
         1. Create "buckets" of participants grouped by identical answer mask
         2. Build a graph where buckets are nodes; edges connect buckets with Hamming distance = 1
         3. BFS-cluster similar answer patterns until targetGroupSize clusters are formed
-        4. Composes final groups by taking one person from each cluster - guaranteeing each group has diverse views represented
+        4. Compose final groups by taking one person from each cluster
 
-        **Group sizes**: Groups may vary by +/-1 when len(participants) is not evenly divisible by targetGroupSize. If len(participants) <= targetGroupSize, all participants are returned as a single group.
+        **textGroupMatch algorithm:**
+        Free-form responses are embedded using a remote preference-embedding model and compared with cosine distance.
+
+        1. Plan group sizes, maximizing the number exactly equal to targetGroupSize while prohibiting groups smaller than 3
+        2. Estimate achievable minimum and maximum average pairwise cosine distance for each planned group size
+        3. Assign normalized diversity targets: up to three levels below 40 groups and five levels at 40 or more groups
+        4. Move groups toward their assigned targets with time-bounded multi-start neighborhood search
+        5. Attach a diffusionStatement selected by maximizing its minimum distance from any member
+
+        Assigned targets are distributed approximately evenly. diversityLevel is a display label derived from assignedTarget, while achievedDiversity and normalizedAchievedDiversity report the result. If embedding fails, the API returns size-preserving random groups with fallbackUsed=true and omits achieved scores.
+
+        Until freeTextResponse is supplied by the upstream survey payload, missing text responses receive deterministic development placeholders.
       tags: [Matching]
       parameters:
         - in: body
@@ -87,8 +99,20 @@ paths:
               results:
                 - groupId: "1"
                   participantIds: ["uid_alice", "uid_dave", "uid_eve"]
+                  diversityLevel: high
+                  assignedTarget: 1.0
+                  achievedDiversity: 0.71
+                  normalizedAchievedDiversity: 0.93
+                  diffusionStatement: "Political compromise is usually more valuable than ideological consistency."
+                  fallbackUsed: false
                 - groupId: "2"
                   participantIds: ["uid_bob", "uid_carol", "uid_frank"]
+                  diversityLevel: medium
+                  assignedTarget: 0.5
+                  achievedDiversity: 0.52
+                  normalizedAchievedDiversity: 0.48
+                  diffusionStatement: "Future generations should have formal representation in present-day decisions."
+                  fallbackUsed: false
         "400":
           $ref: "#/responses/BadRequest"
         "422":
@@ -107,10 +131,10 @@ definitions:
         type: integer
         minimum: 2
         description: |
-          Desired number of participants per output group. Must be >= 2.
+          Desired number of participants per output group.
 
-          If len(participants) <= targetGroupSize, all participants are returned as one group regardless of this value.
-        example: 3
+          binaryGroupMatch requires a value >= 2. textGroupMatch requires a value >= 3 and prioritizes producing as many groups of exactly this size as possible.
+        example: 5
       participants:
         type: object
         description: |
@@ -123,25 +147,30 @@ definitions:
         example:
           uid_alice:
             binaryAnswerMask: "01001"
+            freeTextResponse: "Public transit should be free in major cities."
           uid_bob:
             binaryAnswerMask: "10110"
+            freeTextResponse: "Transit fares help maintain reliable service."
           uid_carol:
             binaryAnswerMask: "01100"
+            freeTextResponse: "Cities should invest more heavily in rail infrastructure."
 
   MatchAlgorithm:
     type: string
     enum:
       - binaryGroupMatch
+      - textGroupMatch
     description: |
-      Matching algorithm to use. Currently supported:
-      - binaryGroupMatch: BFS cluster-then-compose matching on binary answer masks. Add new algorithms here as enum values without changing the rest of the request shape.
+      Matching algorithm to use:
+      - binaryGroupMatch: BFS cluster-then-compose matching on binary answer masks
+      - textGroupMatch: Embedding-based matching toward adaptive numeric diversity targets
 
   ParticipantData:
     type: object
     description: |
-      Free-form per-participant data. No keys are required by the base contract - the algorithm declared in algorithm determines which keys it reads (e.g. binaryGroupMatch reads binaryAnswerMask).
+      Per-participant survey data. The selected algorithm determines which field it reads.
 
-      Unknown keys are ignored by the server and never returned.
+      freeTextResponse is temporarily optional for textGroupMatch while the upstream survey payload is being extended. Missing values receive deterministic placeholders.
     properties:
       binaryAnswerMask:
         type: string
@@ -152,6 +181,12 @@ definitions:
 
           Strings shorter than the longest mask in the request are random-padded server-side.
         example: "01001"
+      freeTextResponse:
+        type: string
+        minLength: 1
+        description: |
+          Free-form survey response embedded by textGroupMatch. Whitespace-only or missing values currently receive a development placeholder.
+        example: "Public transit should be free in major cities."
     additionalProperties: true
 
   MatchResponse:
@@ -185,6 +220,39 @@ definitions:
           type: string
         description: IDs of participants assigned to this group.
         example: ["uid_alice", "uid_dave", "uid_eve"]
+      diversityLevel:
+        type: string
+        enum: [high, medium, low, unknown]
+        description: |
+          Display label derived from assignedTarget for textGroupMatch. Targets below one-third are low, targets above two-thirds are high, and remaining targets are medium. unknown indicates random fallback after participant embedding failure.
+      assignedTarget:
+        type: number
+        format: double
+        minimum: 0
+        maximum: 1
+        description: |
+          Normalized diversity target assigned to this group. Events with 3-39 groups use 0, 0.5, and 1; larger events use 0, 0.25, 0.5, 0.75, and 1. A one-group event uses 0.5 and a two-group event uses 0 and 1.
+      achievedDiversity:
+        type: number
+        format: double
+        minimum: 0
+        maximum: 2
+        description: |
+          Raw average pairwise cosine distance achieved by the group. Omitted when participant embedding fails.
+      normalizedAchievedDiversity:
+        type: number
+        format: double
+        minimum: 0
+        maximum: 1
+        description: |
+          Achieved diversity normalized against the estimated attainable minimum and maximum for this group size. Omitted when participant embedding fails.
+      diffusionStatement:
+        type: string
+        description: |
+          Statement selected to be distant from every group member using a maximin cosine-distance rule. FALLBACK STATEMENT is returned when statement selection is unavailable.
+      fallbackUsed:
+        type: boolean
+        description: Whether textGroupMatch used any documented fallback behavior.
     additionalProperties: true
 
   HealthResponse:
@@ -204,7 +272,9 @@ definitions:
         description: Machine-readable error identifier
         enum:
           - INVALID_ANSWER_MASK
+          - INVALID_TEXT_RESPONSE
           - NO_PARTICIPANTS
+          - INSUFFICIENT_PARTICIPANTS
           - TARGET_GROUP_SIZE_TOO_SMALL
           - UNKNOWN_ALGORITHM
           - INTERNAL_ERROR

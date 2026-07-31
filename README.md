@@ -1,22 +1,89 @@
 # Frankly Match
 
-Frankly Match is an ongoing research and engineering effort to develop the most effective ways to match people into groups for facilitating constructive dialogue.
-
-Code for the "smart matching" feature that is currently used by the Frankly platform lives here. We welcome contributions, forks, comments, issues, etc. from the community. Thanks for stopping by!
+Frankly Match is a research and engineering effort to develop effective ways to match people into groups for constructive dialogue.
 
 ## Contents
 
-- `dart/` — [`frankly_match`](https://pub.dev/packages/frankly_match) pub.dev Dart package.
-- `api/` — Google Cloud Run service implementing the match API. Written in Python for research purposes.
+- `dart/` — [`frankly_match`](https://pub.dev/packages/frankly_match) package containing the original local matching algorithms.
+- `api/` — FastAPI service deployed on Google Cloud Run.
+- `demo/` — Static browser demonstration of the hosted API.
 
-## Description
+## Algorithms
 
-Frankly Match currently consists of one main algorithm which is based on maximizing [Hamming distance](https://en.wikipedia.org/wiki/Hamming_distance) between participant survey answers. 
+The Dart package exposes:
 
-Each participant's survey answers are encoded as a binary string (`"01001"` = one bit per question). The endpoints available are as follows:
+- **`bucketMatch`** — directly maximizes pairwise Hamming distance.
+- **`groupMatch`** — clusters similar binary answer masks, then composes diverse groups.
+- **`randomGroups`** — random assignment baseline.
 
-- **`bucketMatch`** — for pairs. Directly maximises pairwise Hamming distance.
-- **`groupMatch`** — for groups of 3+. BFS-clusters by similarity, then composes groups by taking one member from each cluster.
-- **`randomGroups`** — no survey data needed. Random assignment baseline.
+The HTTP API selects an algorithm through the request's `algorithm` field:
 
-We aim to develop other matching algorithms which may optimize for different heuristics (e.g. maximizing similarity, or creating other interesting configurations). We are also interested in expanding the diversity-matching algorithm to allow it to ingest and factor in more than simple binary answers (e.g. text, multiple-choice, drawings?!). 
+- **`binaryGroupMatch`** — the existing binary-mask group matcher.
+- **`textGroupMatch`** — embeds free-form responses and matches groups toward numeric diversity targets.
+
+Text matching prioritizes group size before diversity. Every group contains at least three participants, and the size planner first maximizes the number of groups exactly equal to `targetGroupSize`. The matcher then estimates the achievable minimum and maximum average pairwise cosine distance for each group size.
+
+Events with 3–39 groups use normalized targets `0`, `0.5`, and `1`. Events with 40 or more groups use `0`, `0.25`, `0.5`, `0.75`, and `1`; one group receives `0.5`, while two groups receive `0` and `1`. A time-bounded neighborhood search moves each group toward its assigned target without changing its size. The API returns the assigned target together with raw and normalized achieved diversity.
+
+Each text-matched group also receives a reusable `diffusionStatement`. The selected statement maximizes its minimum cosine distance from any member of the group.
+
+## Text Response Transition
+
+`freeTextResponse` is defined in the API contract but is not yet guaranteed by the upstream survey payload. During this transition, missing text responses receive deterministic development placeholders. The replacement point is marked with a TODO in `api/main.py`.
+
+## Local API
+
+Create a local environment file:
+
+```bash
+cp .env.example .env
+```
+
+Set `HF_TOKEN` in `.env`, then run:
+
+```bash
+cd api
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn main:app --reload
+```
+
+The main endpoint is `POST /match`, and interactive documentation is available at `http://127.0.0.1:8000/docs`.
+
+Example text request:
+
+```json
+{
+  "algorithm": "textGroupMatch",
+  "targetGroupSize": 5,
+  "participants": {
+    "alice": {
+      "freeTextResponse": "Public transit should be free in major cities."
+    },
+    "bob": {
+      "freeTextResponse": "Transit fares help maintain reliable service."
+    },
+    "carol": {
+      "freeTextResponse": "Cities should invest more heavily in rail."
+    },
+    "dave": {
+      "freeTextResponse": "Neighborhoods should control new development."
+    },
+    "eve": {
+      "freeTextResponse": "Dense housing makes cities more affordable."
+    }
+  }
+}
+```
+
+Text results add `assignedTarget`, `achievedDiversity`, `normalizedAchievedDiversity`, `diversityLevel`, `diffusionStatement`, and `fallbackUsed` to the existing `groupId` and `participantIds` fields.
+
+## Tests
+
+```bash
+cd api
+python -m unittest discover -s tests
+```
+
+Tests mock the embedding endpoint. They do not send participant text or credentials to an external service.
