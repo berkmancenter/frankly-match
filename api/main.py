@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator, model_validator
 
 from match import group_match
-from text_match import TextMatchingService, placeholder_responses
+from text_match import TextMatchingService, _stable_seed, placeholder_responses
 
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
@@ -138,13 +138,18 @@ async def validation_exception_handler(
 # ---------------------------------------------------------------------------
 
 def _normalize_masks(participants: dict[str, ParticipantData]) -> dict[str, str]:
-    """Random-pad shorter masks to the longest length in the request."""
+    """Random-pad shorter masks to the longest length in the request.
+
+    Padding is seeded from the participant ids so identical requests yield
+    identical masks, matching the determinism of the text matching path.
+    """
     masks = {pid: p.binaryAnswerMask for pid, p in participants.items()}
     max_len = max((len(m) for m in masks.values()), default=0)
     if max_len == 0:
         return masks
+    rng = random.Random(_stable_seed(list(masks)))
     return {
-        pid: mask + "".join(random.choice("01") for _ in range(max_len - len(mask)))
+        pid: mask + "".join(rng.choice("01") for _ in range(max_len - len(mask)))
         for pid, mask in masks.items()
     }
 
