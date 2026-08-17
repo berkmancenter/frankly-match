@@ -6,6 +6,7 @@ import random
 import re
 from typing import Literal, Optional
 
+from logger import log
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -114,6 +115,7 @@ _CODE_HINTS = {
 
 
 def _error(code: str, message: str, status: int) -> JSONResponse:
+    log.log_event("ERROR", f"Error {code}: {message}", request=None)
     return JSONResponse({"code": code, "message": message}, status_code=status)
 
 
@@ -161,6 +163,7 @@ def _text_responses(
             if data.freeTextResponse and data.freeTextResponse.strip()
             else placeholders[participant_id]
         )
+        log.log_event("INFO", f"Participant {participant_id} response: {responses[participant_id]}", request=None)
     return responses
 
 
@@ -183,6 +186,8 @@ def match(req: MatchRequest):
     if req.algorithm == "binaryGroupMatch":
         samples = _normalize_masks(req.participants)
         groups = group_match(samples, req.targetGroupSize)
+
+        log.log_event("INFO", f"Matched {len(req.participants)} participants into {len(groups)} groups via binaryGroupMatch", request=req)
         return MatchResponse(
             results=[
                 GroupResult(groupId=str(index + 1), participantIds=group)
@@ -195,6 +200,7 @@ def match(req: MatchRequest):
         participant_responses,
         req.targetGroupSize,
     )
+    log.log_event("INFO", f"Matched {len(req.participants)} participants into {len(groups)} groups via textMatchingService", request=req)
     return MatchResponse(
         results=[
             GroupResult(
