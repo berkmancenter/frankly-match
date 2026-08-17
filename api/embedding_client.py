@@ -4,7 +4,7 @@ import os
 import time
 from collections.abc import Sequence
 
-from logger import Log
+from logger import log
 import httpx
 import numpy as np
 
