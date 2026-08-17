@@ -163,7 +163,12 @@ def _text_responses(
             if data.freeTextResponse and data.freeTextResponse.strip()
             else placeholders[participant_id]
         )
-        log.log_event("INFO", f"Participant {participant_id} response: {responses[participant_id]}", request=None)
+        log.log_event(
+            "INFO",
+            "Received participant response",
+            request=None,
+            extra_data={"participant_id": participant_id, "response_length": len(responses[participant_id])},
+        )
     return responses
 
 
