@@ -187,12 +187,12 @@ def health():
     response_model=MatchResponse,
     response_model_exclude_none=True,
 )
-def match(req: MatchRequest):
+def match(req: MatchRequest, request: Request):
     if req.algorithm == "binaryGroupMatch":
         samples = _normalize_masks(req.participants)
         groups = group_match(samples, req.targetGroupSize)
 
-        log.log_event("INFO", f"Matched {len(req.participants)} participants into {len(groups)} groups via binaryGroupMatch", request=req)
+        log.log_event("INFO", f"Matched {len(req.participants)} participants into {len(groups)} groups via binaryGroupMatch", request=request)
         return MatchResponse(
             results=[
                 GroupResult(groupId=str(index + 1), participantIds=group)
@@ -205,7 +205,7 @@ def match(req: MatchRequest):
         participant_responses,
         req.targetGroupSize,
     )
-    log.log_event("INFO", f"Matched {len(req.participants)} participants into {len(groups)} groups via textMatchingService", request=req)
+    log.log_event("INFO", f"Matched {len(req.participants)} participants into {len(groups)} groups via textMatchingService", request=request)
     return MatchResponse(
         results=[
             GroupResult(
