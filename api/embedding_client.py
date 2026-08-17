@@ -4,6 +4,7 @@ import os
 import time
 from collections.abc import Sequence
 
+from logger import log
 import httpx
 import numpy as np
 
@@ -107,6 +108,7 @@ class HuggingFaceEmbeddingClient:
                 )
             except httpx.RequestError as exc:
                 if attempt == self.max_retries:
+                    Log.log_event("ERROR", "Could not reach the embedding endpoint")
                     raise EmbeddingServiceError(
                         "Could not reach the embedding endpoint"
                     ) from exc
