@@ -1,4 +1,5 @@
 from functools import lru_cache
+import logging
 
 from google.cloud import logging as cloud_logging
 
@@ -32,9 +33,12 @@ class Log:
         if extra_data:
             payload.update(extra_data)
 
-        self._client().logger(self._logger_name).log_struct(
-            payload, severity=severity, trace=self.get_trace(request)
-        )
-
+        try:
+            self._client().logger(self._logger_name).log_struct(
+                payload, severity=severity, trace=self.get_trace(request)
+            )
+        except Exception as e:
+            logging.log(logging.INFO, f"Message: {message}, Extra Data: {extra_data}")
+            print(f"Logging failed: {e}")
 
 log = Log()
