@@ -51,6 +51,36 @@ class MatchApiTests(unittest.TestCase):
         for group in response.json()["results"]:
             self.assertEqual(set(group), {"groupId", "participantIds"})
 
+    def test_binary_mask_padding_is_deterministic(self):
+        participants = {
+            "a": main.ParticipantData(binaryAnswerMask="1"),
+            "b": main.ParticipantData(binaryAnswerMask="1011010110"),
+            "c": main.ParticipantData(binaryAnswerMask="01"),
+        }
+
+        first = main._normalize_masks(participants)
+        second = main._normalize_masks(participants)
+
+        self.assertEqual(first, second)
+
+    def test_binary_match_is_deterministic_with_unequal_masks(self):
+        payload = {
+            "algorithm": "binaryGroupMatch",
+            "targetGroupSize": 2,
+            "participants": {
+                "a": {"binaryAnswerMask": "1"},
+                "b": {"binaryAnswerMask": "1011010110"},
+                "c": {"binaryAnswerMask": "01"},
+                "d": {"binaryAnswerMask": "0110"},
+            },
+        }
+
+        first = self.client.post("/match", json=payload)
+        second = self.client.post("/match", json=payload)
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.json(), second.json())
+
     def test_text_algorithm_returns_extended_group_fields(self):
         service = FakeTextMatchingService()
         with patch.object(
