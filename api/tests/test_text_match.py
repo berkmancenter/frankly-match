@@ -6,8 +6,7 @@ import numpy as np
 from embedding_client import EmbeddingServiceError
 from text_match import (
     FALLBACK_STATEMENT,
-    HIGH_ARM_CEILING_MARGIN,
-    LOW_TO_HIGH_RATIO,
+    TARGET_PULL_IN,
     TextMatchingService,
     cosine_distance_matrix,
     estimate_diversity_bounds,
@@ -62,23 +61,27 @@ class DiversityTargetTests(unittest.TestCase):
             _, levels = plan_diversity_targets(sizes, distances, seed=8)
             self.assertEqual(set(levels), {"low", "medium", "high"})
 
-    def test_uses_thin_high_arm_funded_by_a_larger_low_arm(self):
+    def test_arms_are_balanced_thirds(self):
+        """Balanced allocation: D-optimal for a quadratic dose-response, minimax
+        under unknown per-arm variance, and no arm is one fallback from empty."""
         distances = _distances(60)
         sizes = [5] * 20
         _, levels = plan_diversity_targets(sizes, distances, seed=8)
 
-        self.assertEqual(levels.count("low"), 5)
-        self.assertEqual(levels.count("high"), 2)
-        self.assertEqual(levels.count("medium"), 13)
+        self.assertEqual(levels.count("low"), 7)
+        self.assertEqual(levels.count("medium"), 6)
+        self.assertEqual(levels.count("high"), 7)
 
-    def test_low_to_high_ratio_is_stable_across_event_sizes(self):
-        """The ratio sets the high target, so it must not drift with group count."""
-        for group_count in (20, 24, 40, 50, 100):
+    def test_arm_counts_never_differ_by_more_than_one(self):
+        for group_count in range(3, 101):
             low, middle, high = plan_arm_counts(group_count)
             with self.subTest(groups=group_count):
-                self.assertAlmostEqual(low / high, LOW_TO_HIGH_RATIO, delta=0.15)
                 self.assertEqual(low + middle + high, group_count)
-                self.assertGreaterEqual(middle, 1)
+                self.assertLessEqual(max(low, middle, high) - min(low, middle, high), 1)
+                self.assertGreaterEqual(min(low, middle, high), 1)
+                # extras go to the extreme arms, never the middle
+                self.assertGreaterEqual(low, middle)
+                self.assertGreaterEqual(high, middle)
 
     def test_arm_counts_reject_events_too_small_for_three_levels(self):
         with self.assertRaisesRegex(ValueError, "at least 3 groups"):
@@ -114,12 +117,14 @@ class DiversityTargetTests(unittest.TestCase):
             pool_mean_distance(distances) + 1e-9,
         )
 
-    def test_high_target_follows_the_budget_formula(self):
+    def test_high_target_is_budget_capped_by_the_pulled_in_ceiling(self):
         distances = _distances(60)
         sizes = [5] * 20
         targets, levels = plan_diversity_targets(sizes, distances, seed=8)
         bounds = estimate_diversity_bounds(distances, sizes, seed=8)
         mean_diversity = pool_mean_distance(distances)
+        floor, ceiling = bounds[5]
+        margin = TARGET_PULL_IN * (ceiling - floor)
 
         low = [t for t, level in zip(targets, levels) if level == "low"]
         high = {t for t, level in zip(targets, levels) if level == "high"}
@@ -131,9 +136,25 @@ class DiversityTargetTests(unittest.TestCase):
 
         self.assertEqual(len(high), 1)
         self.assertAlmostEqual(
-            high.pop(),
-            min(expected, bounds[5][1] * HIGH_ARM_CEILING_MARGIN),
+            high.pop(), min(expected, ceiling - margin)
         )
+
+    def test_extreme_targets_leave_symmetric_slack(self):
+        """Targeting the exact floor or ceiling makes assignment error
+        one-sided; the pull-in keeps both extremes strictly inside bounds."""
+        distances = _distances(60)
+        sizes = [5] * 20
+        targets, levels = plan_diversity_targets(sizes, distances, seed=8)
+        bounds = estimate_diversity_bounds(distances, sizes, seed=8)
+        floor, ceiling = bounds[5]
+
+        lows = [t for t, level in zip(targets, levels) if level == "low"]
+        highs = [t for t, level in zip(targets, levels) if level == "high"]
+        self.assertTrue(all(t > floor for t in lows))
+        self.assertTrue(all(t < ceiling for t in highs))
+        margin = TARGET_PULL_IN * (ceiling - floor)
+        for t in lows:
+            self.assertAlmostEqual(t, floor + margin)
 
     def test_targets_are_raw_distances_not_normalized(self):
         distances = _distances(60)

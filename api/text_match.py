@@ -21,27 +21,31 @@ FALLBACK_STATEMENT = "FALLBACK STATEMENT"
 MIN_TEXT_GROUP_SIZE = 3
 EXACT_BOUND_COMBINATION_LIMIT = 20_000
 
-# Group formation redistributes a fixed quantity of disagreement: choosing a
-# partition only chooses which pairs are co-assigned, so the mean achieved
-# diversity is pinned near the pool mean. A target set is feasible only if its
-# mean does not exceed that, which rules out equal thirds. Homogeneous groups
-# consume little of the budget, so they fund the diverse ones and the high target
-# follows as mu * (1 + n_low / n_high) -- a larger low arm buys a more extreme
-# high arm.
+# Group formation redistributes disagreement between groups, so a low arm
+# funds a further high arm (see high_arm_target). An earlier revision leaned on
+# that hard: a 2.5:1 low-to-high ratio pushing a thin high arm as far as the
+# budget allowed. Two problems, both measured on synthetic pools: the
+# achievable ceiling binds at a low-to-high ratio of roughly 0.3-0.5, long
+# before a 2.5 budget does, so most of the extra low groups bought no
+# additional contrast; and a 2-group arm has no usable within-arm variance and
+# is one embedding fallback away from vanishing.
 #
-# The ratio below is PROVISIONAL. The direction (more low than high) follows from
-# the budget, but the magnitude was chosen against one distance distribution and
-# may not suit the deployed embedding's: how much headroom a pool has above
-# versus below its mean varies a lot between metrics, and when the achievable
-# ceiling binds before the budget does, a wider high arm is better than a
-# further one. Revisit once a real pool's geometry has been measured.
-HIGH_ARM_FRACTION = 0.10
-LOW_TO_HIGH_RATIO = 2.5
-# Leave the optimizer slack instead of targeting the estimated ceiling exactly.
-HIGH_ARM_CEILING_MARGIN = 0.97
-# Below this many groups a three-level design is not identifiable. Every group is
-# targeted at the pool mean instead, which still improves on random assignment by
-# removing scatter rather than by shifting the mean.
+# The allocation is therefore balanced: near-equal thirds. That choice is
+# deliberately conservative rather than contrast-maximal:
+# - it is the D-optimal design for a quadratic dose-response on three support
+#   points, so an inverted-U (too much diversity harming deliberation) is
+#   detectable rather than assumed away;
+# - with unknown, possibly unequal outcome variance across arms, equal
+#   allocation is the minimax choice;
+# - every arm can lose a group to fallback and still be estimable.
+# Against the ceiling-capped contrast this costs ~15% SNR versus the
+# endpoints-only optimum, and gains ~55% over the old 5/13/2 split.
+#
+# Targets are pulled in from the achievable extremes by TARGET_PULL_IN of the
+# range. Targeting the exact floor or ceiling means the optimizer can only miss
+# inward, which makes assignment error one-sided; a symmetric margin keeps the
+# error roughly centered and the extreme arms reliably reachable.
+TARGET_PULL_IN = 0.05
 MIN_GROUPS_FOR_LEVELS = 3
 
 DUMMY_PARTICIPANT_STATEMENTS = (
@@ -115,9 +119,9 @@ class DiversityOptimizationResult:
     assigned_targets: list[float]
     diversity_levels: list[DiversityLevel]
     # Pool geometry the targets were derived from. Carried out so it can be
-    # logged: r* = (ceiling - mean) / (mean - floor) is what decides whether
-    # LOW_TO_HIGH_RATIO is set anywhere near right, and it can only be measured
-    # against real pools.
+    # logged: r* = (ceiling - mean) / (mean - floor) locates where the
+    # achievable ceiling starts binding, and it can only be measured against
+    # real pools.
     pool_mean_diversity: float = 0.0
     bounds_by_size: dict[int, tuple[float, float]] = field(default_factory=dict)
 
@@ -206,27 +210,19 @@ def pool_mean_distance(distances: np.ndarray) -> float:
 
 
 def plan_arm_counts(group_count: int) -> tuple[int, int, int]:
-    """How many groups go in the low, middle and high arms.
+    """Near-equal thirds: (low, middle, high), extras to low then high.
 
-    Pure arithmetic on the group count -- no distances involved. The low arm is
-    derived from the high arm rather than rounding both against the group count,
-    so that n_low / n_high, which is what sets the high target, stays put instead
-    of drifting with event size.
+    Pure arithmetic on the group count -- no distances involved. Extras go to
+    the extreme arms: an extra low group relaxes the diversity budget, an extra
+    high group adds precision where outcome variance is most suspect.
     """
     if group_count < MIN_GROUPS_FOR_LEVELS:
         raise ValueError(
             f"three arms require at least {MIN_GROUPS_FOR_LEVELS} groups"
         )
-
-    high_count = max(1, round(group_count * HIGH_ARM_FRACTION))
-    low_count = max(1, round(high_count * LOW_TO_HIGH_RATIO))
-    while low_count + high_count >= group_count:
-        if low_count > 1:
-            low_count -= 1
-        elif high_count > 1:
-            high_count -= 1
-        else:  # pragma: no cover - unreachable for group_count >= 3
-            break
+    base, extras = divmod(group_count, 3)
+    low_count = base + (1 if extras >= 1 else 0)
+    high_count = base + (1 if extras >= 2 else 0)
     return low_count, group_count - low_count - high_count, high_count
 
 
@@ -287,8 +283,13 @@ def plan_diversity_targets(
     )
     random.Random(seed ^ 0xD1A3E571).shuffle(arms)
 
+    def pulled_bounds(size: int) -> tuple[float, float]:
+        floor, ceiling = bounds_by_size[size]
+        margin = TARGET_PULL_IN * (ceiling - floor)
+        return floor + margin, ceiling - margin
+
     low_targets = {
-        index: bounds_by_size[sizes[index]][0]
+        index: pulled_bounds(sizes[index])[0]
         for index, arm in enumerate(arms)
         if arm == "low"
     }
@@ -303,7 +304,7 @@ def plan_diversity_targets(
         elif arm == "medium":
             targets.append(mean_diversity)
         else:
-            ceiling = bounds_by_size[sizes[index]][1] * HIGH_ARM_CEILING_MARGIN
+            ceiling = pulled_bounds(sizes[index])[1]
             targets.append(max(mean_diversity, min(high_target, ceiling)))
     return targets, arms
 
@@ -498,10 +499,11 @@ def _log_pool_geometry(
 ) -> None:
     """Log the distance geometry each event's targets were derived from.
 
-    HIGH_ARM_FRACTION and LOW_TO_HIGH_RATIO were set against one distance
-    distribution. r_star is the ratio at which the achievable ceiling starts
-    binding, so extra low groups stop buying contrast beyond it; logging it per
-    event is what lets those constants be set from measured pools instead.
+    r_star is the low-to-high ratio at which the achievable ceiling starts
+    binding, so low groups beyond it stop buying contrast. The balanced
+    allocation sits near 1; logging r_star per event verifies against real
+    pools that the ceiling, not the budget, is the binding constraint there
+    too, and by how much.
     """
     mean = optimization.pool_mean_diversity
     bounds = {
@@ -510,11 +512,10 @@ def _log_pool_geometry(
     }
     r_star_by_size = {}
     for size, (low, high) in optimization.bounds_by_size.items():
-        headroom = mean - low
+        margin = TARGET_PULL_IN * (high - low)
+        headroom = mean - (low + margin)
         if headroom > 1e-9:
-            r_star_by_size[str(size)] = (
-                high * HIGH_ARM_CEILING_MARGIN - mean
-            ) / headroom
+            r_star_by_size[str(size)] = (high - margin - mean) / headroom
 
     level_counts: dict[str, int] = {}
     for level in optimization.diversity_levels:
@@ -528,8 +529,7 @@ def _log_pool_geometry(
             "pool_mean_diversity": mean,
             "bounds_by_size": bounds,
             "r_star_by_size": r_star_by_size,
-            "configured_low_to_high_ratio": LOW_TO_HIGH_RATIO,
-            "configured_high_arm_fraction": HIGH_ARM_FRACTION,
+            "configured_target_pull_in": TARGET_PULL_IN,
             "arm_counts": level_counts,
             "assigned_targets": optimization.assigned_targets,
             "achieved_diversities": optimization.achieved_diversities,

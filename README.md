@@ -95,10 +95,10 @@ Every `/match` call emits structured entries through `api/logger.py`:
 - a group-size report comparing produced groups against `plan_group_sizes`, and
   `condition_counts` giving the number of groups in each diversity arm.
 - the pool geometry each event's targets were derived from: pool mean, the
-  achievable floor and ceiling per group size, and `r_star_by_size`, the ratio
-  at which the achievable ceiling starts binding. `LOW_TO_HIGH_RATIO` should be
-  set from measured `r_star` values rather than from a single assumed distance
-  distribution.
+  achievable floor and ceiling per group size, and `r_star_by_size`, the
+  low-to-high ratio at which the achievable ceiling starts binding. On the
+  synthetic pools used to set the design this was ~0.3-0.5, which is why the
+  arms are balanced rather than skewed toward a large low arm.
 
 Size mismatches and unassigned participants raise `WARNING` and `ERROR`. A high
 arm below two groups raises a `WARNING`, since the contrast is not estimable.
