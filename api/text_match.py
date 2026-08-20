@@ -7,7 +7,7 @@ import random
 import threading
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import combinations
 from typing import Literal, Protocol
 
@@ -114,6 +114,12 @@ class DiversityOptimizationResult:
     achieved_diversities: list[float]
     assigned_targets: list[float]
     diversity_levels: list[DiversityLevel]
+    # Pool geometry the targets were derived from. Carried out so it can be
+    # logged: r* = (ceiling - mean) / (mean - floor) is what decides whether
+    # LOW_TO_HIGH_RATIO is set anywhere near right, and it can only be measured
+    # against real pools.
+    pool_mean_diversity: float = 0.0
+    bounds_by_size: dict[int, tuple[float, float]] = field(default_factory=dict)
 
 
 def placeholder_responses(participant_ids: Sequence[str]) -> dict[str, str]:
@@ -481,6 +487,60 @@ def optimize_diversity_groups(
         achieved_diversities=best_scores,
         assigned_targets=assigned_targets,
         diversity_levels=diversity_levels,
+        pool_mean_diversity=pool_mean_distance(distances),
+        bounds_by_size=bounds_by_size,
+    )
+
+
+def _log_pool_geometry(
+    optimization: DiversityOptimizationResult,
+    request=None,
+) -> None:
+    """Log the distance geometry each event's targets were derived from.
+
+    HIGH_ARM_FRACTION and LOW_TO_HIGH_RATIO were set against one distance
+    distribution. r_star is the ratio at which the achievable ceiling starts
+    binding, so extra low groups stop buying contrast beyond it; logging it per
+    event is what lets those constants be set from measured pools instead.
+    """
+    mean = optimization.pool_mean_diversity
+    bounds = {
+        str(size): {"floor": low, "ceiling": high}
+        for size, (low, high) in optimization.bounds_by_size.items()
+    }
+    r_star_by_size = {}
+    for size, (low, high) in optimization.bounds_by_size.items():
+        headroom = mean - low
+        if headroom > 1e-9:
+            r_star_by_size[str(size)] = (
+                high * HIGH_ARM_CEILING_MARGIN - mean
+            ) / headroom
+
+    level_counts: dict[str, int] = {}
+    for level in optimization.diversity_levels:
+        level_counts[level] = level_counts.get(level, 0) + 1
+
+    log.log_event(
+        "INFO",
+        f"Diversity targets planned from pool mean {mean:.4f}",
+        request=request,
+        extra_data={
+            "pool_mean_diversity": mean,
+            "bounds_by_size": bounds,
+            "r_star_by_size": r_star_by_size,
+            "configured_low_to_high_ratio": LOW_TO_HIGH_RATIO,
+            "configured_high_arm_fraction": HIGH_ARM_FRACTION,
+            "arm_counts": level_counts,
+            "assigned_targets": optimization.assigned_targets,
+            "achieved_diversities": optimization.achieved_diversities,
+            "target_error": [
+                achieved - target
+                for achieved, target in zip(
+                    optimization.achieved_diversities,
+                    optimization.assigned_targets,
+                )
+            ],
+        },
     )
 
 
@@ -525,6 +585,7 @@ class TextMatchingService:
         self,
         participant_responses: dict[str, str],
         target_group_size: int,
+        request=None,
     ) -> list[TextMatchGroup]:
         participant_ids = list(participant_responses)
         group_sizes = plan_group_sizes(len(participant_ids), target_group_size)
@@ -535,7 +596,12 @@ class TextMatchingService:
                 list(participant_responses.values())
             )
         except EmbeddingServiceError as exc:
-            log.log_event("WARNING", f"Participant embedding failed; using random fallback: {exc}", request=None)
+            log.log_event(
+                "WARNING",
+                f"Participant embedding failed; using random fallback: {exc}",
+                request=request,
+                extra_data={"participant_count": len(participant_ids)},
+            )
             return self._fallback_groups(participant_ids, group_sizes, seed)
 
         optimization = optimize_diversity_groups(
@@ -545,6 +611,8 @@ class TextMatchingService:
             seed=seed,
             time_limit_seconds=self.optimization_seconds,
         )
+        _log_pool_geometry(optimization, request)
+
         embedding_by_id = {
             participant_id: participant_embeddings[index]
             for index, participant_id in enumerate(participant_ids)
@@ -553,7 +621,11 @@ class TextMatchingService:
         try:
             diffusion_embeddings = self._get_diffusion_embeddings()
         except EmbeddingServiceError as exc:
-            log.log_event("WARNING", f"Diffusion statement embedding failed; using fallback statement: {exc}", request=None)
+            log.log_event(
+                "WARNING",
+                f"Diffusion statement embedding failed; using fallback statement: {exc}",
+                request=request,
+            )
             return [
                 self._build_group(optimization, index, FALLBACK_STATEMENT, True)
                 for index in range(len(optimization.groups))

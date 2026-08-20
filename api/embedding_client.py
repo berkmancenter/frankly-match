@@ -108,7 +108,16 @@ class HuggingFaceEmbeddingClient:
                 )
             except httpx.RequestError as exc:
                 if attempt == self.max_retries:
-                    Log.log_event("ERROR", "Could not reach the embedding endpoint")
+                    log.log_event(
+                        "ERROR",
+                        "Could not reach the embedding endpoint",
+                        request=None,
+                        extra_data={
+                            "endpoint_url": self.endpoint_url,
+                            "attempts": attempt + 1,
+                            "error": str(exc),
+                        },
+                    )
                     raise EmbeddingServiceError(
                         "Could not reach the embedding endpoint"
                     ) from exc

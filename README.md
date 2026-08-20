@@ -77,9 +77,35 @@ Example text request:
 }
 ```
 
-Text results add `diversityLevel`, `assignedTarget`, `achievedDiversity`, `diffusionStatement`, and `fallbackUsed` to the existing `groupId` and `participantIds` fields.
+Text results add `diversityLevel` and `diffusionStatement` to the existing `groupId` and `participantIds` fields.
 
-Text responses also return a top-level `participantResponses` map giving the text that was actually embedded for each participant. Persist this alongside the groups: participants who supply no `freeTextResponse` receive a deterministic placeholder, so it is the only record of what the groups were built from, and re-embedding it reproduces the distance matrix that downstream analysis needs.
+The matching diagnostics are no longer in the response. `assignedTarget`,
+`achievedDiversity`, `fallbackUsed` and the text that was actually embedded all
+go to Google Cloud Logging instead (see Logging below).
+
+## Logging
+
+Every `/match` call emits structured entries through `api/logger.py`:
+
+- the embedded text per participant, flagged where a placeholder was
+  substituted. This is the only record of what the groups were built from, and
+  re-embedding it reproduces the distance matrix downstream analysis needs.
+- the resulting groups with assigned target, achieved diversity, diffusion
+  statement and fallback flag.
+- a group-size report comparing produced groups against `plan_group_sizes`, and
+  `condition_counts` giving the number of groups in each diversity arm.
+- the pool geometry each event's targets were derived from: pool mean, the
+  achievable floor and ceiling per group size, and `r_star_by_size`, the ratio
+  at which the achievable ceiling starts binding. `LOW_TO_HIGH_RATIO` should be
+  set from measured `r_star` values rather than from a single assumed distance
+  distribution.
+
+Size mismatches and unassigned participants raise `WARNING` and `ERROR`. A high
+arm below two groups raises a `WARNING`, since the contrast is not estimable.
+
+**Retention.** These logs are now the system of record for the embedded text.
+The default Cloud Logging bucket expires entries after 30 days, which is shorter
+than any study timeline — route a sink to BigQuery or GCS before relying on this.
 
 ## Tests
 
