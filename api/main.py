@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+import os
 import random
 import re
 from typing import Literal, Optional
@@ -111,6 +112,14 @@ class MatchResponse(BaseModel):
     # diagnostic rather than something the client acts on, so it is logged now.
 
 
+class MissingTextResponses(Exception):
+    def __init__(self, participant_ids: list[str]):
+        self.participant_ids = participant_ids
+        super().__init__(
+            f"{len(participant_ids)} participant(s) have no freeTextResponse"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Error handling
 # ---------------------------------------------------------------------------
@@ -128,6 +137,25 @@ _CODE_HINTS = {
 def _error(code: str, message: str, status: int) -> JSONResponse:
     log.log_event("ERROR", f"Error {code}: {message}", request=None)
     return JSONResponse({"code": code, "message": message}, status_code=status)
+
+
+@app.exception_handler(MissingTextResponses)
+async def missing_text_handler(request: Request, exc: MissingTextResponses) -> JSONResponse:
+    log.log_event(
+        "ERROR",
+        f"Refusing to match: {len(exc.participant_ids)} participant(s) "
+        f"missing freeTextResponse and REQUIRE_REAL_TEXT is set",
+        request=request,
+        extra_data={"participant_ids_missing_text": exc.participant_ids},
+    )
+    return JSONResponse(
+        {
+            "code": "MISSING_TEXT_RESPONSES",
+            "message": "freeTextResponse missing or empty for: "
+            + ", ".join(exc.participant_ids),
+        },
+        status_code=422,
+    )
 
 
 @app.exception_handler(RequestValidationError)
@@ -177,6 +205,14 @@ def _text_responses(
         responses[participant_id] = supplied or placeholders[participant_id]
 
     placeholder_set = set(placeholder_ids)
+    # One-shot-event protection: groups formed from placeholder text are
+    # meaningless but look statistically perfect, so a silent substitution at a
+    # live event would burn the only demonstration. Strict mode turns the silent
+    # fallback into a loud, listable refusal. Enable REQUIRE_REAL_TEXT=1 in the
+    # deployed environment for real events; leave off for demos and tests.
+    if placeholder_ids and os.getenv("REQUIRE_REAL_TEXT", "").lower() in {"1", "true", "yes"}:
+        raise MissingTextResponses(placeholder_ids)
+
     log.log_event(
         "INFO",
         f"Collected {len(responses)} participant responses "

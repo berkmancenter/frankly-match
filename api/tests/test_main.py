@@ -189,6 +189,49 @@ class MatchApiTests(unittest.TestCase):
         self.assertFalse(dropped["all_participants_assigned"])
         self.assertEqual(dropped["participants_assigned"], 95)
 
+    def test_strict_mode_refuses_placeholder_substitution(self):
+        """At a live event, groups built from placeholder text would look
+        statistically perfect and mean nothing. REQUIRE_REAL_TEXT turns the
+        silent substitution into a listable 422."""
+        service = FakeTextMatchingService()
+        with patch.object(
+            main, "get_text_matching_service", return_value=service
+        ), patch.dict(main.os.environ, {"REQUIRE_REAL_TEXT": "1"}):
+            response = self.client.post(
+                "/match",
+                json={
+                    "algorithm": "textGroupMatch",
+                    "targetGroupSize": 3,
+                    "participants": {
+                        "a": {"freeTextResponse": "real text"},
+                        "b": {},
+                        "c": {"freeTextResponse": "   "},
+                    },
+                },
+            )
+        self.assertEqual(response.status_code, 422)
+        body = response.json()
+        self.assertEqual(body["code"], "MISSING_TEXT_RESPONSES")
+        self.assertIn("b", body["message"])
+        self.assertIn("c", body["message"])
+        self.assertIsNone(service.participant_responses)
+
+    def test_strict_mode_off_keeps_placeholder_fallback(self):
+        service = FakeTextMatchingService()
+        with patch.object(
+            main, "get_text_matching_service", return_value=service
+        ), patch.dict(main.os.environ, {}, clear=False):
+            main.os.environ.pop("REQUIRE_REAL_TEXT", None)
+            response = self.client.post(
+                "/match",
+                json={
+                    "algorithm": "textGroupMatch",
+                    "targetGroupSize": 3,
+                    "participants": {"a": {}, "b": {}, "c": {}},
+                },
+            )
+        self.assertEqual(response.status_code, 200)
+
     def test_text_algorithm_requires_three_participants(self):
         response = self.client.post(
             "/match",
