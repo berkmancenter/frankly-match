@@ -3,7 +3,7 @@ info:
   title: Frankly Match API
   description: |
     Group matching algorithms for creating groups of participants in deliberations, in order to foster constructive dialogue.
-  version: 1.2.0
+  version: 2.0.0
   contact:
     name: Frankly / Berkman Klein Center
     url: https://github.com/berkmancenter/frankly

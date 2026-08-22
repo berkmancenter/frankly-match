@@ -13,10 +13,7 @@ from text_match import (
     TextMatchingService,
     cosine_distance_matrix,
     estimate_diversity_bounds,
-    high_arm_target,
-    optimize_diversity_groups,
     plan_arm_counts,
-    plan_diversity_targets,
     plan_group_sizes,
     pool_mean_distance,
     select_diffusion_statement,
@@ -56,26 +53,6 @@ def _distances(count: int, dimensions: int = 8, seed: int = 5) -> np.ndarray:
 
 
 class DiversityTargetTests(unittest.TestCase):
-    def test_always_plans_three_levels(self):
-        """No silent switch to five levels at any event size."""
-        distances = _distances(60)
-        for group_count in (4, 12, 40):
-            sizes = [5] * group_count
-            _, levels = plan_diversity_targets(sizes, distances, seed=8)
-            self.assertEqual(set(levels), {"low", "medium", "high"})
-
-    def test_allocates_sqrt_two_to_one_to_one(self):
-        """Medium arm is sqrt(2)x an extreme arm: minimises the larger marginal
-        variance of the medium-versus-extreme contrasts, which the confirmatory
-        curvature test depends on."""
-        distances = _distances(60)
-        sizes = [5] * 20
-        _, levels = plan_diversity_targets(sizes, distances, seed=8)
-
-        self.assertEqual(levels.count("low"), 6)
-        self.assertEqual(levels.count("medium"), 8)
-        self.assertEqual(levels.count("high"), 6)
-
     def test_reproduces_the_published_allocation_at_25_groups(self):
         self.assertEqual(plan_arm_counts(25), (7, 11, 7))
 
@@ -103,96 +80,6 @@ class DiversityTargetTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "at least 3 groups"):
             plan_arm_counts(2)
 
-    def test_high_target_takes_exactly_what_the_low_arm_frees(self):
-        # Two low groups each 0.4 below the mean free 0.8 for one high group.
-        self.assertAlmostEqual(
-            high_arm_target(1.0, [0.6, 0.6], high_count=1), 1.8
-        )
-        # Same slack shared between two high groups reaches half as far.
-        self.assertAlmostEqual(
-            high_arm_target(1.0, [0.6, 0.6], high_count=2), 1.4
-        )
-
-    def test_high_target_reduces_to_the_familiar_form_at_a_zero_floor(self):
-        """H = mu * (1 + n_low / n_high) when the low arm sits at zero."""
-        for low_count, high_count in ((1, 1), (3, 1), (5, 2)):
-            with self.subTest(low=low_count, high=high_count):
-                self.assertAlmostEqual(
-                    high_arm_target(2.0, [0.0] * low_count, high_count),
-                    2.0 * (1 + low_count / high_count),
-                )
-
-    def test_targets_respect_the_budget_constraint(self):
-        """Mean of the assigned targets must not exceed the pool mean."""
-        distances = _distances(60)
-        sizes = [5] * 12
-        targets, _ = plan_diversity_targets(sizes, distances, seed=8)
-
-        self.assertLessEqual(
-            float(np.mean(targets)),
-            pool_mean_distance(distances) + 1e-9,
-        )
-
-    def test_high_target_is_budget_capped_by_the_pulled_in_ceiling(self):
-        distances = _distances(60)
-        sizes = [5] * 20
-        targets, levels = plan_diversity_targets(sizes, distances, seed=8)
-        bounds = estimate_diversity_bounds(distances, sizes, seed=8)
-        mean_diversity = pool_mean_distance(distances)
-        floor, ceiling = bounds[5]
-        margin = TARGET_PULL_IN * (ceiling - floor)
-
-        low = [t for t, level in zip(targets, levels) if level == "low"]
-        high = {t for t, level in zip(targets, levels) if level == "high"}
-        expected = (
-            len(sizes) * mean_diversity
-            - sum(low)
-            - levels.count("medium") * mean_diversity
-        ) / levels.count("high")
-
-        self.assertEqual(len(high), 1)
-        self.assertAlmostEqual(
-            high.pop(), min(expected, ceiling - margin)
-        )
-
-    def test_extreme_targets_leave_symmetric_slack(self):
-        """Targeting the exact floor or ceiling makes assignment error
-        one-sided; the pull-in keeps both extremes strictly inside bounds."""
-        distances = _distances(60)
-        sizes = [5] * 20
-        targets, levels = plan_diversity_targets(sizes, distances, seed=8)
-        bounds = estimate_diversity_bounds(distances, sizes, seed=8)
-        floor, ceiling = bounds[5]
-
-        lows = [t for t, level in zip(targets, levels) if level == "low"]
-        highs = [t for t, level in zip(targets, levels) if level == "high"]
-        self.assertTrue(all(t > floor for t in lows))
-        self.assertTrue(all(t < ceiling for t in highs))
-        margin = TARGET_PULL_IN * (ceiling - floor)
-        for t in lows:
-            self.assertAlmostEqual(t, floor + margin)
-
-    def test_targets_are_raw_distances_not_normalized(self):
-        distances = _distances(60)
-        sizes = [5] * 12
-        targets, _ = plan_diversity_targets(sizes, distances, seed=8)
-
-        self.assertNotIn(0.0, targets)
-        self.assertNotIn(1.0, targets)
-        self.assertIn(pool_mean_distance(distances), targets)
-
-    def test_falls_back_to_uniform_targets_below_three_groups(self):
-        distances = _distances(20)
-        for group_count in (1, 2):
-            sizes = [5] * group_count
-            targets, levels = plan_diversity_targets(sizes, distances, seed=8)
-            self.assertEqual(levels, ["medium"] * group_count)
-            self.assertEqual(
-                targets, [pool_mean_distance(distances)] * group_count
-            )
-
-
-class DiversityOptimizationTests(unittest.TestCase):
     def test_estimates_exact_bounds_for_small_instances(self):
         embeddings = np.random.default_rng(4).normal(size=(8, 5))
         distances = cosine_distance_matrix(embeddings)
@@ -216,49 +103,6 @@ class DiversityOptimizationTests(unittest.TestCase):
             bounds[3],
             (min(brute_force_scores), max(brute_force_scores)),
         )
-
-    def test_preserves_sizes_and_targets_numeric_diversity(self):
-        rng = np.random.default_rng(7)
-        embeddings = rng.normal(size=(18, 8))
-        participant_ids = [f"p{index}" for index in range(18)]
-        group_sizes = [5, 5, 5, 3]
-
-        initial = optimize_diversity_groups(
-            participant_ids,
-            embeddings,
-            group_sizes,
-            seed=12,
-            time_limit_seconds=0,
-            max_restarts=1,
-        )
-        result = optimize_diversity_groups(
-            participant_ids,
-            embeddings,
-            group_sizes,
-            seed=12,
-            time_limit_seconds=1.0,
-            max_restarts=1,
-            iterations_per_restart=500,
-        )
-
-        self.assertEqual([len(group) for group in result.groups], group_sizes)
-        self.assertCountEqual(
-            [
-                participant_id
-                for group in result.groups
-                for participant_id in group
-            ],
-            participant_ids,
-        )
-        # 4 groups -> sqrt(2):1:1 rounds to 1 low / 2 medium / 1 high
-        self.assertEqual(result.diversity_levels.count("low"), 1)
-        self.assertEqual(result.diversity_levels.count("medium"), 2)
-        self.assertEqual(result.diversity_levels.count("high"), 1)
-
-        by_target = sorted(
-            zip(result.assigned_targets, result.achieved_diversities)
-        )
-        self.assertLessEqual(by_target[0][1], by_target[-1][1])
 
     def test_cosine_distance_normalizes_input(self):
         distances = cosine_distance_matrix(
@@ -336,6 +180,32 @@ class EventDesignTests(unittest.TestCase):
         self.assertIn(3, by_arm["medium"])
         self.assertEqual(set(by_arm["low"]), {5})
         self.assertEqual(set(by_arm["high"]), {5})
+
+    def test_every_event_gets_all_three_levels(self):
+        """No silent switch to a different number of conditions at any size."""
+        for group_count in (4, 12, 25, 40, 100):
+            low, middle, high = plan_arm_counts(group_count)
+            with self.subTest(groups=group_count):
+                self.assertGreaterEqual(min(low, middle, high), 1)
+                self.assertEqual(low + middle + high, group_count)
+
+    def test_allocates_sqrt_two_to_one_to_one(self):
+        """Medium arm is sqrt(2)x an extreme arm: minimises the larger marginal
+        variance of the medium-versus-extreme contrasts, which the confirmatory
+        curvature test depends on."""
+        self.assertEqual(plan_arm_counts(20), (6, 8, 6))
+        self.assertEqual(plan_arm_counts(25), (7, 11, 7))
+
+    def test_pull_in_margin_is_symmetric_on_both_bounds(self):
+        """TARGET_PULL_IN no longer sets targets -- minimax has none -- but it
+        still defines the logged margin, and it must apply to both ends."""
+        ids, distances = self._pool()
+        design = design_event(ids, distances, 4, seed=7, time_limit_seconds=1)
+        for arm in design.arms:
+            with self.subTest(level=arm.level):
+                self.assertAlmostEqual(
+                    arm.margin, TARGET_PULL_IN * (arm.ceiling - arm.floor)
+                )
 
     def test_pools_are_disjoint_and_cover_everyone(self):
         ids, distances = self._pool()
