@@ -64,6 +64,15 @@ MIN_GROUPS_FOR_LEVELS = 3
 # error roughly centered and the extreme arms reliably reachable.
 TARGET_PULL_IN = 0.05
 
+# An arm is accepted when its restarts agree, not when it clears a fixed bound.
+# The achievable floor/ceiling describe what ONE optimally-chosen group reaches;
+# minimax needs every group in the arm to clear the bar simultaneously, and the
+# arm's groups must average near their pool's mean, so a single-group bound is
+# not reachable by construction. Agreement across independent restarts is the
+# evidence that the arm is at its real limit rather than stuck.
+CONVERGENCE_TOLERANCE = 0.10  # spread across restarts, as a share of pool distance SD
+ENDPOINT_RESTARTS = 10
+
 DUMMY_PARTICIPANT_STATEMENTS = (
     "Public transit should be free in major cities.",
     "Public transit fares are necessary to maintain reliable service.",
@@ -352,6 +361,400 @@ def estimate_diversity_bounds(
     }
 
 
+
+def assign_sizes_to_arms(
+    group_sizes: Sequence[int],
+    target_group_size: int,
+    arm_counts: tuple[int, int, int],
+) -> dict[DiversityLevel, list[int]]:
+    """Which group sizes each arm gets.
+
+    Off-size groups go to the medium arm. Achievable floor and ceiling depend on
+    group size, so uniform extreme arms have a single well-defined bound each,
+    and the extreme arms carry the contrast so their comparability matters most.
+    """
+    sizes = list(group_sizes)
+    low_count, medium_count, high_count = arm_counts
+    if low_count + medium_count + high_count != len(sizes):
+        raise ValueError("arm counts must account for every group")
+
+    uniform = [s for s in sizes if s == target_group_size]
+    ragged = [s for s in sizes if s != target_group_size]
+    if len(ragged) > medium_count:
+        raise ValueError(
+            f"{len(ragged)} off-size groups exceed the medium arm's {medium_count}"
+        )
+
+    medium = ragged + uniform[: medium_count - len(ragged)]
+    remaining = uniform[medium_count - len(ragged) :]
+    return {
+        "low": remaining[:low_count],
+        "medium": medium,
+        "high": remaining[low_count:],
+    }
+
+
+def randomize_pools(
+    participant_ids: Sequence[str],
+    people_per_arm: dict[DiversityLevel, int],
+    *,
+    seed: int,
+) -> dict[DiversityLevel, list[str]]:
+    """Randomly partition participants into the three condition pools.
+
+    This is what makes assignment to condition exactly random: the optimizer
+    only ever rearranges people within their own pool afterwards, so it cannot
+    decide who experiences which condition.
+    """
+    ids = list(participant_ids)
+    if sum(people_per_arm.values()) != len(ids):
+        raise ValueError("pool sizes must account for every participant")
+
+    order = ids[:]
+    random.Random(seed).shuffle(order)
+    pools: dict[DiversityLevel, list[str]] = {}
+    start = 0
+    for level in ("low", "medium", "high"):
+        count = people_per_arm[level]
+        pools[level] = order[start : start + count]
+        start += count
+    return pools
+
+
+class _Objective(Protocol):
+    """Maximised by the annealer. Higher is better."""
+
+    def __call__(self, scores: Sequence[float]) -> float:
+        ...
+
+
+def _minimise_max(scores: Sequence[float]) -> float:
+    """Low arm: no group may exceed the bar, so drive the worst one down."""
+    return -max(scores)
+
+
+def _maximise_min(scores: Sequence[float]) -> float:
+    """High arm: every group must clear the bar, so drive the worst one up."""
+    return min(scores)
+
+
+def _mse_to_target(target: float):
+    """Medium arm: sit AT a value, so deviation either way is undesirable."""
+
+    def objective(scores: Sequence[float]) -> float:
+        achieved = np.asarray(scores, dtype=np.float64)
+        return -float(np.mean(np.square(achieved - target)))
+
+    return objective
+
+
+@dataclass(frozen=True)
+class _AnnealResult:
+    groups: list[list[int]]
+    scores: list[float]
+    restarts_used: int
+    deadline_bound: bool
+    restart_bests: list[float]
+
+
+def _anneal_groups(
+    distances: np.ndarray,
+    sizes: Sequence[int],
+    objective: _Objective,
+    *,
+    seed: int,
+    time_limit_seconds: float,
+    temperature_scale: float,
+    max_restarts: int = 8,
+    iterations_per_restart: int | None = None,
+) -> _AnnealResult:
+    """Multi-start annealing over group membership for an arbitrary objective.
+
+    The objective is evaluated over the whole arm rather than per group, because
+    minimax depends on which group is currently worst -- touching one group can
+    change the arm's score through a different group entirely.
+    """
+    sizes = list(sizes)
+    count = sum(sizes)
+    rng = random.Random(seed)
+    deadline = time.monotonic() + max(0.0, time_limit_seconds)
+    iteration_limit = (
+        iterations_per_restart
+        if iterations_per_restart is not None
+        else max(20_000, count * 200)
+    )
+
+    best_groups: list[list[int]] | None = None
+    best_scores: list[float] | None = None
+    best_objective = -math.inf
+    restart_bests: list[float] = []
+    restarts_used = 0
+    deadline_bound = False
+
+    for restart in range(max_restarts):
+        restarts_used = restart + 1
+        shuffled = list(range(count))
+        rng.shuffle(shuffled)
+        groups = _allocate_indices(shuffled, sizes)
+        scores = [_group_diversity(group, distances) for group in groups]
+        current = objective(scores)
+        restart_best = current
+
+        if current > best_objective:
+            best_objective = current
+            best_groups = [group[:] for group in groups]
+            best_scores = scores[:]
+
+        if len(groups) == 1 or time.monotonic() >= deadline:
+            if time.monotonic() >= deadline:
+                deadline_bound = True
+            restart_bests.append(restart_best)
+            break
+
+        temperature = 0.05 * temperature_scale
+        for iteration in range(iteration_limit):
+            if time.monotonic() >= deadline:
+                deadline_bound = True
+                break
+
+            if len(groups) >= 3 and iteration % 7 == 0:
+                picks = rng.sample(range(len(groups)), 3)
+                positions = tuple(rng.randrange(len(groups[g])) for g in picks)
+                previous = tuple(groups[g][p] for g, p in zip(picks, positions))
+                rotated = (previous[2], previous[0], previous[1])
+            else:
+                picks = rng.sample(range(len(groups)), 2)
+                positions = tuple(rng.randrange(len(groups[g])) for g in picks)
+                previous = tuple(groups[g][p] for g, p in zip(picks, positions))
+                rotated = (previous[1], previous[0])
+
+            for g, p, member in zip(picks, positions, rotated):
+                groups[g][p] = member
+
+            previous_scores = tuple(scores[g] for g in picks)
+            for g in picks:
+                scores[g] = _group_diversity(groups[g], distances)
+            candidate = objective(scores)
+
+            delta = candidate - current
+            cooling = max(
+                0.002 * temperature_scale,
+                temperature * (1.0 - iteration / iteration_limit),
+            )
+            if delta >= 0 or rng.random() < math.exp(delta / cooling):
+                current = candidate
+                if current > restart_best:
+                    restart_best = current
+                if current > best_objective:
+                    best_objective = current
+                    best_groups = [group[:] for group in groups]
+                    best_scores = scores[:]
+            else:
+                for g, score in zip(picks, previous_scores):
+                    scores[g] = score
+                for g, p, member in zip(picks, positions, previous):
+                    groups[g][p] = member
+
+        restart_bests.append(restart_best)
+        if time.monotonic() >= deadline:
+            deadline_bound = True
+            break
+
+    if best_groups is None or best_scores is None:  # pragma: no cover
+        raise RuntimeError("annealing did not produce an assignment")
+
+    return _AnnealResult(
+        groups=best_groups,
+        scores=best_scores,
+        restarts_used=restarts_used,
+        deadline_bound=deadline_bound,
+        restart_bests=restart_bests,
+    )
+
+
+@dataclass(frozen=True)
+class ArmDesign:
+    level: DiversityLevel
+    groups: list[list[str]]
+    achieved: list[float]
+    sizes: list[int]
+    floor: float
+    ceiling: float
+    margin: float
+    target: float | None
+    restarts_used: int
+    deadline_bound: bool
+    restart_statistics: list[float]
+    restart_spread: float
+    converged: bool
+
+
+@dataclass(frozen=True)
+class EventDesign:
+    arms: list[ArmDesign]
+    pools: dict[str, list[str]]
+    pool_mean: float
+    endpoint_low: float | None
+    endpoint_high: float | None
+    medium_target: float | None
+    arms_separated: bool | None
+    low_to_medium_gap: float | None
+    medium_to_high_gap: float | None
+
+
+def _submatrix(distances: np.ndarray, index_of: dict[str, int], ids: Sequence[str]):
+    picks = np.array([index_of[i] for i in ids], dtype=np.int64)
+    return distances[np.ix_(picks, picks)]
+
+
+def _restart_statistic(
+    level: DiversityLevel, objective_value: float
+) -> float:
+    """Restart results in interpretable units rather than objective units.
+
+    Low and high report the arm's worst group in distance units, since that is
+    what minimax is driving. Medium reports RMSE to its target.
+    """
+    if level == "low":
+        return -objective_value
+    if level == "high":
+        return objective_value
+    return math.sqrt(max(0.0, -objective_value))
+
+
+def _optimise_arm(
+    level: DiversityLevel,
+    ids: Sequence[str],
+    sub: np.ndarray,
+    sizes: Sequence[int],
+    *,
+    seed: int,
+    time_limit_seconds: float,
+    target: float | None = None,
+    max_restarts: int = ENDPOINT_RESTARTS,
+) -> ArmDesign:
+    """Optimise one pool. Endpoints use minimax; the medium arm targets a value."""
+    sizes = list(sizes)
+    modal = max(set(sizes), key=sizes.count)
+    floor, ceiling = estimate_diversity_bounds(sub, sizes, seed=seed)[modal]
+    margin = TARGET_PULL_IN * (ceiling - floor)
+    spread = sub[np.triu_indices(len(ids), k=1)]
+    pool_sd = max(float(spread.std()), 1e-12)
+
+    if level == "low":
+        objective, scale = _minimise_max, pool_sd
+    elif level == "high":
+        objective, scale = _maximise_min, pool_sd
+    else:
+        objective = _mse_to_target(target)
+        scale = max(float(spread.var()), 1e-12)
+
+    result = _anneal_groups(
+        sub,
+        sizes,
+        objective,
+        seed=seed,
+        time_limit_seconds=time_limit_seconds,
+        temperature_scale=scale,
+        max_restarts=max_restarts,
+    )
+
+    statistics = [_restart_statistic(level, b) for b in result.restart_bests]
+    restart_spread = max(statistics) - min(statistics) if statistics else 0.0
+    return ArmDesign(
+        level=level,
+        groups=[[ids[i] for i in g] for g in result.groups],
+        achieved=result.scores,
+        sizes=sizes,
+        floor=floor,
+        ceiling=ceiling,
+        margin=margin,
+        target=target,
+        restarts_used=result.restarts_used,
+        deadline_bound=result.deadline_bound,
+        restart_statistics=statistics,
+        restart_spread=restart_spread,
+        converged=restart_spread <= CONVERGENCE_TOLERANCE * pool_sd,
+    )
+
+
+def design_event(
+    participant_ids: Sequence[str],
+    distances: np.ndarray,
+    target_group_size: int,
+    *,
+    seed: int,
+    time_limit_seconds: float,
+) -> EventDesign:
+    """Plan sizes, randomise into pools, optimise endpoints, then the medium arm.
+
+    The medium target is the midpoint of the ACHIEVED endpoint means, so the
+    ordering matters: it cannot be computed until the endpoint arms have run.
+    Equal spacing is what preserves beta_2 = -C/2 for the confirmatory contrast.
+    """
+    ids = list(participant_ids)
+    index_of = {pid: i for i, pid in enumerate(ids)}
+    sizes = plan_group_sizes(len(ids), target_group_size)
+    pool_mean = pool_mean_distance(distances)
+
+    if len(sizes) < MIN_GROUPS_FOR_LEVELS:
+        # No three-arm design is identifiable. Every group takes the pool mean.
+        arm = _optimise_arm(
+            "medium", ids, distances, sizes,
+            seed=seed, time_limit_seconds=time_limit_seconds, target=pool_mean,
+        )
+        return EventDesign(
+            arms=[arm], pools={"medium": ids}, pool_mean=pool_mean,
+            endpoint_low=None, endpoint_high=None, medium_target=pool_mean,
+            arms_separated=None, low_to_medium_gap=None, medium_to_high_gap=None,
+        )
+
+    arm_counts = plan_arm_counts(len(sizes))
+    sizes_by_arm = assign_sizes_to_arms(sizes, target_group_size, arm_counts)
+    people_per_arm = {lvl: sum(s) for lvl, s in sizes_by_arm.items()}
+    pools = randomize_pools(ids, people_per_arm, seed=seed)
+
+    share = max(0.0, time_limit_seconds) / 3.0
+    endpoints = {}
+    for level in ("low", "high"):
+        endpoints[level] = _optimise_arm(
+            level,
+            pools[level],
+            _submatrix(distances, index_of, pools[level]),
+            sizes_by_arm[level],
+            seed=seed ^ (0xA11 if level == "low" else 0xB22),
+            time_limit_seconds=share,
+        )
+
+    low_mean = float(np.mean(endpoints["low"].achieved))
+    high_mean = float(np.mean(endpoints["high"].achieved))
+    medium_target = (low_mean + high_mean) / 2.0
+
+    medium = _optimise_arm(
+        "medium",
+        pools["medium"],
+        _submatrix(distances, index_of, pools["medium"]),
+        sizes_by_arm["medium"],
+        seed=seed ^ 0xC33,
+        time_limit_seconds=share,
+        target=medium_target,
+    )
+
+    low_to_medium = min(medium.achieved) - max(endpoints["low"].achieved)
+    medium_to_high = min(endpoints["high"].achieved) - max(medium.achieved)
+    return EventDesign(
+        arms=[endpoints["low"], medium, endpoints["high"]],
+        pools=pools,
+        pool_mean=pool_mean,
+        endpoint_low=low_mean,
+        endpoint_high=high_mean,
+        medium_target=medium_target,
+        arms_separated=low_to_medium > 0 and medium_to_high > 0,
+        low_to_medium_gap=low_to_medium,
+        medium_to_high_gap=medium_to_high,
+    )
+
+
 def optimize_diversity_groups(
     participant_ids: Sequence[str],
     embeddings: np.ndarray,
@@ -509,55 +912,83 @@ def optimize_diversity_groups(
     )
 
 
-def _log_pool_geometry(
-    optimization: DiversityOptimizationResult,
-    request=None,
-) -> None:
-    """Log the distance geometry each event's targets were derived from.
+def _log_event_design(design: EventDesign, request=None) -> None:
+    """Per-event structured log: geometry, arm status, doses, separation.
 
-    r_star is the low-to-high ratio at which the achievable ceiling starts
-    binding, so low groups beyond it stop buying contrast. The balanced
-    allocation sits near 1; logging r_star per event verifies against real
-    pools that the ceiling, not the budget, is the binding constraint there
-    too, and by how much.
+    Doses are also reported on the calibrated Bradley-Terry axis,
+    arccos(1 - d) / pi, the predicted fraction of voters who would split on a
+    pair at distance d.
     """
-    mean = optimization.pool_mean_diversity
-    bounds = {
-        str(size): {"floor": low, "ceiling": high}
-        for size, (low, high) in optimization.bounds_by_size.items()
-    }
-    r_star_by_size = {}
-    for size, (low, high) in optimization.bounds_by_size.items():
-        margin = TARGET_PULL_IN * (high - low)
-        headroom = mean - (low + margin)
-        if headroom > 1e-9:
-            r_star_by_size[str(size)] = (high - margin - mean) / headroom
 
-    level_counts: dict[str, int] = {}
-    for level in optimization.diversity_levels:
-        level_counts[level] = level_counts.get(level, 0) + 1
+    def bradley_terry(distance: float) -> float:
+        return math.acos(max(-1.0, min(1.0, 1.0 - distance))) / math.pi
+
+    arms_payload = []
+    for arm in design.arms:
+        arms_payload.append(
+            {
+                "level": arm.level,
+                "groups": len(arm.groups),
+                "people": sum(arm.sizes),
+                "sizes": arm.sizes,
+                "target": arm.target,
+                "achieved": arm.achieved,
+                "achieved_mean": float(np.mean(arm.achieved)),
+                "achieved_mean_bt": bradley_terry(float(np.mean(arm.achieved))),
+                "floor": arm.floor,
+                "ceiling": arm.ceiling,
+                "margin": arm.margin,
+                "restarts_used": arm.restarts_used,
+                "restart_statistics": arm.restart_statistics,
+                "restart_spread": arm.restart_spread,
+                "converged": arm.converged,
+                "deadline_bound": arm.deadline_bound,
+            }
+        )
 
     log.log_event(
         "INFO",
-        f"Diversity targets planned from pool mean {mean:.4f}",
+        "Event design",
         request=request,
         extra_data={
-            "pool_mean_diversity": mean,
-            "bounds_by_size": bounds,
-            "r_star_by_size": r_star_by_size,
-            "configured_target_pull_in": TARGET_PULL_IN,
-            "arm_counts": level_counts,
-            "assigned_targets": optimization.assigned_targets,
-            "achieved_diversities": optimization.achieved_diversities,
-            "target_error": [
-                achieved - target
-                for achieved, target in zip(
-                    optimization.achieved_diversities,
-                    optimization.assigned_targets,
-                )
-            ],
+            "pool_mean": design.pool_mean,
+            "endpoint_low": design.endpoint_low,
+            "endpoint_high": design.endpoint_high,
+            "medium_target": design.medium_target,
+            "arms_separated": design.arms_separated,
+            "low_to_medium_gap": design.low_to_medium_gap,
+            "medium_to_high_gap": design.medium_to_high_gap,
+            "condition_counts": {a.level: len(a.groups) for a in design.arms},
+            "pool_counts": {level: len(ids) for level, ids in design.pools.items()},
+            "arms": arms_payload,
         },
     )
+
+    for arm in design.arms:
+        if not arm.converged:
+            log.log_event(
+                "WARNING",
+                f"{arm.level} arm did not converge across restarts "
+                f"(spread {arm.restart_spread:.4f}); its achieved level may not be "
+                f"the pool's limit",
+                request=request,
+                extra_data={
+                    "level": arm.level,
+                    "restart_statistics": arm.restart_statistics,
+                    "deadline_bound": arm.deadline_bound,
+                },
+            )
+
+    if design.arms_separated is False:
+        log.log_event(
+            "WARNING",
+            "Diversity arms overlap; the manipulation did not separate cleanly",
+            request=request,
+            extra_data={
+                "low_to_medium_gap": design.low_to_medium_gap,
+                "medium_to_high_gap": design.medium_to_high_gap,
+            },
+        )
 
 
 def select_diffusion_statement(
@@ -620,19 +1051,27 @@ class TextMatchingService:
             )
             return self._fallback_groups(participant_ids, group_sizes, seed)
 
-        optimization = optimize_diversity_groups(
+        # Randomisation into condition pools happens here, after embedding, so a
+        # REQUIRE_REAL_TEXT failure aborts before anyone is assigned, and before
+        # any distance-based decision is taken.
+        design = design_event(
             participant_ids,
-            participant_embeddings,
-            group_sizes,
+            cosine_distance_matrix(participant_embeddings),
+            target_group_size,
             seed=seed,
             time_limit_seconds=self.optimization_seconds,
         )
-        _log_pool_geometry(optimization, request)
+        _log_event_design(design, request)
 
         embedding_by_id = {
             participant_id: participant_embeddings[index]
             for index, participant_id in enumerate(participant_ids)
         }
+        flat = [
+            (arm, group, achieved)
+            for arm in design.arms
+            for group, achieved in zip(arm.groups, arm.achieved)
+        ]
 
         try:
             diffusion_embeddings = self._get_diffusion_embeddings()
@@ -643,12 +1082,12 @@ class TextMatchingService:
                 request=request,
             )
             return [
-                self._build_group(optimization, index, FALLBACK_STATEMENT, True)
-                for index in range(len(optimization.groups))
+                self._build_group(arm, group, achieved, FALLBACK_STATEMENT, True)
+                for arm, group, achieved in flat
             ]
 
         results = []
-        for index, group in enumerate(optimization.groups):
+        for arm, group, achieved in flat:
             group_embeddings = np.vstack(
                 [embedding_by_id[participant_id] for participant_id in group]
             )
@@ -657,23 +1096,26 @@ class TextMatchingService:
                 diffusion_embeddings,
                 self.diffusion_statements,
             )
-            results.append(self._build_group(optimization, index, statement, False))
+            results.append(
+                self._build_group(arm, group, achieved, statement, False)
+            )
         return results
 
     @staticmethod
     def _build_group(
-        optimization: DiversityOptimizationResult,
-        index: int,
+        arm: ArmDesign,
+        group: list[str],
+        achieved: float,
         diffusion_statement: str,
         fallback_used: bool,
     ) -> TextMatchGroup:
         return TextMatchGroup(
-            participant_ids=optimization.groups[index],
-            diversity_level=optimization.diversity_levels[index],
+            participant_ids=group,
+            diversity_level=arm.level,
             diffusion_statement=diffusion_statement,
             fallback_used=fallback_used,
-            assigned_target=optimization.assigned_targets[index],
-            achieved_diversity=optimization.achieved_diversities[index],
+            assigned_target=arm.target,
+            achieved_diversity=achieved,
         )
 
     def _get_diffusion_embeddings(self) -> np.ndarray:

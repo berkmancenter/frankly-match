@@ -73,15 +73,15 @@ paths:
         **textGroupMatch algorithm:**
         Free-form responses are embedded using a remote preference-embedding model and compared with cosine distance.
 
-        1. Plan group sizes, maximizing the number exactly equal to targetGroupSize while prohibiting groups smaller than 3
-        2. Estimate achievable minimum and maximum average pairwise cosine distance for each planned group size
-        3. Assign three diversity targets - low, medium and high - as raw cosine distances
-        4. Move groups toward their assigned targets with time-bounded multi-start neighborhood search
-        5. Attach a diffusionStatement selected by maximizing its minimum distance from any member
+        1. Plan group sizes, then allocate groups to arms as sqrt(2):1:1 (medium:low:high). Off-size groups go to the medium arm so the extreme arms stay uniform.
+        2. Randomly split participants into three pools, one per arm. Assignment to condition is exactly random; the optimizer only rearranges people within their own pool afterwards.
+        3. Optimize each endpoint pool by minimax - the low pool minimizes its worst group's diversity, the high pool maximizes its worst - so the arm label holds for every group, not on average.
+        4. Set the medium target to the midpoint of the two achieved endpoint means, giving equally spaced doses, then optimize the medium pool toward it.
+        5. Check the arms for overlap and report whether each arm's independent restarts agreed.
 
-        Targets are raw cosine distances rather than normalized values, so they are directly comparable across events. Group formation can only redistribute the disagreement already present in the pool, so the achieved diversities average to roughly the pool mean. Targets are set within that limit: low groups target the achievable minimum, medium groups the pool mean, and the high target is whatever the remaining budget allows, capped at the achievable maximum. Roughly a quarter of groups are low and a tenth are high. Events with fewer than three groups cannot support three levels, so every group targets the pool mean.
+        Randomization happens after embedding, so a REQUIRE_REAL_TEXT failure aborts before anyone is assigned to a condition.
 
-        diversityLevel reports which arm a group was assigned to. The assigned target, the achieved diversity, the fallback flag and the embedded participant text are not returned in the response - they are written to Google Cloud Logging as structured fields so the payload stays small on large events. If embedding fails, the API still returns size-preserving random groups; the logs record fallbackUsed=true.
+        diversityLevel reports which arm a group was randomized into and is the regressor for analysis; achievedDiversity reports what the group reached. assignedTarget is present only for the medium arm, since minimax has no target by construction. Per-event diagnostics - pool geometry, feasible bounds per arm, achieved endpoint means, the medium target, arm-overlap gaps and per-arm restart convergence - are logged rather than returned. If embedding fails, the API returns size-preserving random groups with fallbackUsed=true and omits achieved scores.
 
         Until freeTextResponse is supplied by the upstream survey payload, missing text responses receive deterministic development placeholders.
       tags: [Matching]
@@ -218,7 +218,7 @@ definitions:
         type: string
         enum: [high, medium, low, unknown]
         description: |
-          Which arm this group was assigned to for textGroupMatch: low, medium or high. unknown indicates random fallback after participant embedding failure.
+          Which arm this group was randomized into for textGroupMatch: low, medium or high. This is the randomized assignment and is the regressor for analysis; achievedDiversity is post-randomization. unknown indicates random fallback after participant embedding failure.
       diffusionStatement:
         type: string
         description: |

@@ -1,0 +1,1490 @@
+From 134093194a4754f3e67fe6eb2b9df80a2061987c Mon Sep 17 00:00:00 2001
+From: Carter Blair <cartergblair@gmail.com>
+Date: Thu, 20 Aug 2026 18:38:17 +0000
+Subject: [PATCH 1/5] feat: route matching diagnostics through Cloud Logging
+ instead of the response
+
+Adopts the logger from #6 across the absolute-diversity text matching path.
+
+Response now carries only what the client renders: groupId, participantIds,
+diversityLevel, diffusionStatement. Moved to structured extra_data:
+
+- assignedTarget, achievedDiversity, fallbackUsed
+- participantResponses, which was the largest item in the payload on a big
+  event and is diagnostic rather than actionable for the client
+- the pool geometry targets were derived from: pool mean, achievable floor and
+  ceiling per group size, and r_star_by_size
+
+r_star = (ceiling * margin - mean) / (mean - floor) is the ratio at which the
+achievable ceiling starts binding, so low groups past it buy no additional
+contrast. LOW_TO_HIGH_RATIO is currently 2.5 against a measured r_star of
+roughly 0.26-0.49 on synthetic pools; logging it per event is what allows the
+constant to be set from real data.
+
+Also:
+- group-size report per request (planned vs actual, histogram, assignment
+  coverage); mismatch logs WARNING, unassigned participants log ERROR
+- condition_counts keyed on diversity_level, since raw targets are continuous
+- WARNING when the high arm has fewer than two groups, where the contrast is
+  not estimable
+- thread the FastAPI request through TextMatchingService.match so matching logs
+  share the request trace
+- fix embedding_client.py calling an unimported Log class with a missing
+  request argument
+- one aggregate participant-response log instead of one call per participant
+- openapi.yaml, README and demo updated for the trimmed contract
+---
+ README.md               |  32 ++++++-
+ api/embedding_client.py |  11 ++-
+ api/main.py             | 188 +++++++++++++++++++++++++++++++++-------
+ api/openapi.yaml        |  39 +--------
+ api/tests/test_main.py  |  99 ++++++++++++++++++---
+ api/text_match.py       |  78 ++++++++++++++++-
+ demo/text.html          |  22 +----
+ 7 files changed, 365 insertions(+), 104 deletions(-)
+
+diff --git a/README.md b/README.md
+index ec79326..95e739f 100644
+--- a/README.md
++++ b/README.md
+@@ -77,9 +77,35 @@ Example text request:
+ }
+ ```
+ 
+-Text results add `diversityLevel`, `assignedTarget`, `achievedDiversity`, `diffusionStatement`, and `fallbackUsed` to the existing `groupId` and `participantIds` fields.
+-
+-Text responses also return a top-level `participantResponses` map giving the text that was actually embedded for each participant. Persist this alongside the groups: participants who supply no `freeTextResponse` receive a deterministic placeholder, so it is the only record of what the groups were built from, and re-embedding it reproduces the distance matrix that downstream analysis needs.
++Text results add `diversityLevel` and `diffusionStatement` to the existing `groupId` and `participantIds` fields.
++
++The matching diagnostics are no longer in the response. `assignedTarget`,
++`achievedDiversity`, `fallbackUsed` and the text that was actually embedded all
++go to Google Cloud Logging instead (see Logging below).
++
++## Logging
++
++Every `/match` call emits structured entries through `api/logger.py`:
++
++- the embedded text per participant, flagged where a placeholder was
++  substituted. This is the only record of what the groups were built from, and
++  re-embedding it reproduces the distance matrix downstream analysis needs.
++- the resulting groups with assigned target, achieved diversity, diffusion
++  statement and fallback flag.
++- a group-size report comparing produced groups against `plan_group_sizes`, and
++  `condition_counts` giving the number of groups in each diversity arm.
++- the pool geometry each event's targets were derived from: pool mean, the
++  achievable floor and ceiling per group size, and `r_star_by_size`, the ratio
++  at which the achievable ceiling starts binding. `LOW_TO_HIGH_RATIO` should be
++  set from measured `r_star` values rather than from a single assumed distance
++  distribution.
++
++Size mismatches and unassigned participants raise `WARNING` and `ERROR`. A high
++arm below two groups raises a `WARNING`, since the contrast is not estimable.
++
++**Retention.** These logs are now the system of record for the embedded text.
++The default Cloud Logging bucket expires entries after 30 days, which is shorter
++than any study timeline — route a sink to BigQuery or GCS before relying on this.
+ 
+ ## Tests
+ 
+diff --git a/api/embedding_client.py b/api/embedding_client.py
+index b051797..547a5f9 100644
+--- a/api/embedding_client.py
++++ b/api/embedding_client.py
+@@ -108,7 +108,16 @@ class HuggingFaceEmbeddingClient:
+                 )
+             except httpx.RequestError as exc:
+                 if attempt == self.max_retries:
+-                    Log.log_event("ERROR", "Could not reach the embedding endpoint")
++                    log.log_event(
++                        "ERROR",
++                        "Could not reach the embedding endpoint",
++                        request=None,
++                        extra_data={
++                            "endpoint_url": self.endpoint_url,
++                            "attempts": attempt + 1,
++                            "error": str(exc),
++                        },
++                    )
+                     raise EmbeddingServiceError(
+                         "Could not reach the embedding endpoint"
+                     ) from exc
+diff --git a/api/main.py b/api/main.py
+index 851e2a2..27727c5 100644
+--- a/api/main.py
++++ b/api/main.py
+@@ -15,13 +15,17 @@ from fastapi.responses import JSONResponse
+ from pydantic import BaseModel, field_validator, model_validator
+ 
+ from match import group_match
+-from text_match import TextMatchingService, placeholder_responses
++from text_match import (
++    TextMatchingService,
++    placeholder_responses,
++    plan_group_sizes,
++)
+ 
+ 
+ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+ 
+ 
+-app = FastAPI(title="Frankly Match API", version="1.2.0")
++app = FastAPI(title="Frankly Match API", version="2.0.0")
+ app.add_middleware(
+     CORSMiddleware,
+     allow_origins=["*"],
+@@ -86,21 +90,25 @@ class MatchRequest(BaseModel):
+ 
+ 
+ class GroupResult(BaseModel):
++    """Client-facing group payload.
++
++    assignedTarget, achievedDiversity and fallbackUsed are deliberately absent.
++    They are matching diagnostics, not something the client renders, and they go
++    to Google Cloud Logging as structured extra_data instead.
++    """
++
+     groupId: str
+     participantIds: list[str]
+     diversityLevel: Optional[Literal["high", "medium", "low", "unknown"]] = None
+-    assignedTarget: Optional[float] = None
+-    achievedDiversity: Optional[float] = None
+     diffusionStatement: Optional[str] = None
+-    fallbackUsed: Optional[bool] = None
+ 
+ 
+ class MatchResponse(BaseModel):
+     results: list[GroupResult]
+-    # The text actually embedded, per participant. Worth returning because a
+-    # participant with no freeTextResponse receives a placeholder, so the caller
+-    # cannot otherwise reconstruct what the groups were built from.
+-    participantResponses: Optional[dict[str, str]] = None
++    # participantResponses used to be returned here so a caller could see what
++    # was actually embedded when a participant supplied no freeTextResponse.
++    # That is the single largest thing in the payload on a big event, and it is
++    # diagnostic rather than something the client acts on, so it is logged now.
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -156,25 +164,73 @@ def _normalize_masks(participants: dict[str, ParticipantData]) -> dict[str, str]
+ 
+ def _text_responses(
+     participants: dict[str, ParticipantData],
++    request: Request | None = None,
+ ) -> dict[str, str]:
+     placeholders = placeholder_responses(list(participants))
+-    responses = {}
++    responses: dict[str, str] = {}
++    placeholder_ids: list[str] = []
+     for participant_id, data in participants.items():
++        supplied = data.freeTextResponse.strip() if data.freeTextResponse else ""
+         # TODO: Remove placeholder responses once freeTextResponse is guaranteed in the payload.
+-        responses[participant_id] = (
+-            data.freeTextResponse.strip()
+-            if data.freeTextResponse and data.freeTextResponse.strip()
+-            else placeholders[participant_id]
+-        )
+-        log.log_event(
+-            "INFO",
+-            "Received participant response",
+-            request=None,
+-            extra_data={"participant_id": participant_id, "response_length": len(responses[participant_id])},
+-        )
++        if not supplied:
++            placeholder_ids.append(participant_id)
++        responses[participant_id] = supplied or placeholders[participant_id]
++
++    placeholder_set = set(placeholder_ids)
++    log.log_event(
++        "INFO",
++        f"Collected {len(responses)} participant responses "
++        f"({len(placeholder_ids)} placeholder)",
++        request=request,
++        extra_data={
++            "participant_count": len(responses),
++            "placeholder_count": len(placeholder_ids),
++            "placeholder_participant_ids": placeholder_ids,
++            # This is what used to ride back in MatchResponse.participantResponses.
++            "responses": [
++                {
++                    "participant_id": participant_id,
++                    "response": text,
++                    "response_length": len(text),
++                    "is_placeholder": participant_id in placeholder_set,
++                }
++                for participant_id, text in responses.items()
++            ],
++        },
++    )
+     return responses
+ 
+ 
++def _group_size_report(
++    participant_count: int,
++    target_group_size: int,
++    group_sizes: list[int],
++) -> dict:
++    """Compare the groups actually produced against the planned sizing."""
++    report = {
++        "participant_count": participant_count,
++        "target_group_size": target_group_size,
++        "group_count": len(group_sizes),
++        "group_sizes": group_sizes,
++        "size_histogram": {
++            str(size): group_sizes.count(size) for size in sorted(set(group_sizes))
++        },
++        "participants_assigned": sum(group_sizes),
++    }
++    try:
++        planned = plan_group_sizes(participant_count, target_group_size)
++    except ValueError:
++        planned = None
++    if planned is not None:
++        report["planned_group_count"] = len(planned)
++        report["planned_group_sizes"] = planned
++        report["matches_plan"] = sorted(planned) == sorted(group_sizes)
++    report["all_participants_assigned"] = (
++        report["participants_assigned"] == participant_count
++    )
++    return report
++
++
+ @lru_cache(maxsize=1)
+ def get_text_matching_service() -> TextMatchingService:
+     return TextMatchingService.from_environment()
+@@ -195,7 +251,22 @@ def match(req: MatchRequest, request: Request):
+         samples = _normalize_masks(req.participants)
+         groups = group_match(samples, req.targetGroupSize)
+ 
+-        log.log_event("INFO", f"Matched {len(req.participants)} participants into {len(groups)} groups via binaryGroupMatch", request=request)
++        log.log_event(
++            "INFO",
++            f"Matched {len(req.participants)} participants into {len(groups)} "
++            f"groups via binaryGroupMatch",
++            request=request,
++            extra_data={
++                "algorithm": "binaryGroupMatch",
++                "participants": samples,
++                "groups": groups,
++                "group_sizes": _group_size_report(
++                    len(req.participants),
++                    req.targetGroupSize,
++                    [len(group) for group in groups],
++                ),
++            },
++        )
+         return MatchResponse(
+             results=[
+                 GroupResult(groupId=str(index + 1), participantIds=group)
+@@ -203,24 +274,83 @@ def match(req: MatchRequest, request: Request):
+             ]
+         )
+ 
+-    participant_responses = _text_responses(req.participants)
++    participant_responses = _text_responses(req.participants, request)
+     groups = get_text_matching_service().match(
+         participant_responses,
+         req.targetGroupSize,
++        request,
++    )
++
++    size_report = _group_size_report(
++        len(req.participants),
++        req.targetGroupSize,
++        [len(group.participant_ids) for group in groups],
+     )
+-    log.log_event("INFO", f"Matched {len(req.participants)} participants into {len(groups)} groups via textMatchingService", request=request)
++    # Keyed on diversity_level rather than assigned_target: targets are raw
++    # distances on the embedding's scale, so counting by target value would put
++    # every group in its own bucket. Levels are a fixed enum.
++    condition_counts: dict[str, int] = {}
++    for group in groups:
++        level = group.diversity_level
++        condition_counts[level] = condition_counts.get(level, 0) + 1
++
++    log.log_event(
++        "INFO",
++        f"Matched {len(req.participants)} participants into {len(groups)} "
++        f"groups via textGroupMatch",
++        request=request,
++        extra_data={
++            "algorithm": "textGroupMatch",
++            "group_sizes": size_report,
++            "condition_counts": condition_counts,
++            "fallback_group_count": sum(1 for group in groups if group.fallback_used),
++            "groups": [
++                {
++                    "groupId": str(index + 1),
++                    "participantIds": group.participant_ids,
++                    "diversityLevel": group.diversity_level,
++                    "assignedTarget": group.assigned_target,
++                    "achievedDiversity": group.achieved_diversity,
++                    "diffusionStatement": group.diffusion_statement,
++                    "fallbackUsed": group.fallback_used,
++                }
++                for index, group in enumerate(groups)
++            ],
++        },
++    )
++
++    if not size_report.get("matches_plan", True):
++        log.log_event(
++            "WARNING",
++            "Produced group sizes do not match the planned sizing",
++            request=request,
++            extra_data=size_report,
++        )
++    if not size_report["all_participants_assigned"]:
++        log.log_event(
++            "ERROR",
++            f"{size_report['participants_assigned']} of "
++            f"{size_report['participant_count']} participants were assigned to a group",
++            request=request,
++            extra_data=size_report,
++        )
++    if condition_counts.get("high", 0) < 2:
++        log.log_event(
++            "WARNING",
++            f"Only {condition_counts.get('high', 0)} group(s) in the high "
++            f"diversity arm; the contrast is not estimable at this event size",
++            request=request,
++            extra_data={"condition_counts": condition_counts},
++        )
++
+     return MatchResponse(
+         results=[
+             GroupResult(
+                 groupId=str(index + 1),
+                 participantIds=group.participant_ids,
+                 diversityLevel=group.diversity_level,
+-                assignedTarget=group.assigned_target,
+-                achievedDiversity=group.achieved_diversity,
+                 diffusionStatement=group.diffusion_statement,
+-                fallbackUsed=group.fallback_used,
+             )
+             for index, group in enumerate(groups)
+-        ],
+-        participantResponses=participant_responses,
++        ]
+     )
+diff --git a/api/openapi.yaml b/api/openapi.yaml
+index 2b67fb8..c8a160c 100644
+--- a/api/openapi.yaml
++++ b/api/openapi.yaml
+@@ -81,7 +81,7 @@ paths:
+ 
+         Targets are raw cosine distances rather than normalized values, so they are directly comparable across events. Group formation can only redistribute the disagreement already present in the pool, so the achieved diversities average to roughly the pool mean. Targets are set within that limit: low groups target the achievable minimum, medium groups the pool mean, and the high target is whatever the remaining budget allows, capped at the achievable maximum. Roughly a quarter of groups are low and a tenth are high. Events with fewer than three groups cannot support three levels, so every group targets the pool mean.
+ 
+-        diversityLevel reports which arm a group was assigned to, and achievedDiversity what it reached. If embedding fails, the API returns size-preserving random groups with fallbackUsed=true and omits achieved scores.
++        diversityLevel reports which arm a group was assigned to. The assigned target, the achieved diversity, the fallback flag and the embedded participant text are not returned in the response - they are written to Google Cloud Logging as structured fields so the payload stays small on large events. If embedding fails, the API still returns size-preserving random groups; the logs record fallbackUsed=true.
+ 
+         Until freeTextResponse is supplied by the upstream survey payload, missing text responses receive deterministic development placeholders.
+       tags: [Matching]
+@@ -102,20 +102,11 @@ paths:
+                 - groupId: "1"
+                   participantIds: ["uid_alice", "uid_dave", "uid_eve"]
+                   diversityLevel: high
+-                  assignedTarget: 1.12
+-                  achievedDiversity: 1.07
+                   diffusionStatement: "Political compromise is usually more valuable than ideological consistency."
+-                  fallbackUsed: false
+                 - groupId: "2"
+                   participantIds: ["uid_bob", "uid_carol", "uid_frank"]
+                   diversityLevel: medium
+-                  assignedTarget: 0.86
+-                  achievedDiversity: 0.87
+                   diffusionStatement: "Future generations should have formal representation in present-day decisions."
+-                  fallbackUsed: false
+-              participantResponses:
+-                uid_alice: "Public transit should be free in major cities."
+-                uid_bob: "Transit fares help maintain reliable service."
+         "400":
+           $ref: "#/responses/BadRequest"
+         "422":
+@@ -196,17 +187,6 @@ definitions:
+     type: object
+     required: [results]
+     properties:
+-      participantResponses:
+-        type: object
+-        additionalProperties:
+-          type: string
+-        description: |
+-          The text actually embedded, keyed by participantId. Returned for textGroupMatch only.
+-
+-          Worth persisting: a participant who supplies no freeTextResponse receives a deterministic placeholder, so this is the only record of what the groups were actually built from. Re-embedding it reproduces the distance matrix, which is what downstream analysis needs.
+-        example:
+-          uid_alice: "Public transit should be free in major cities."
+-          uid_bob: "Transit fares help maintain reliable service."
+       results:
+         type: array
+         description: |
+@@ -239,27 +219,10 @@ definitions:
+         enum: [high, medium, low, unknown]
+         description: |
+           Which arm this group was assigned to for textGroupMatch: low, medium or high. unknown indicates random fallback after participant embedding failure.
+-      assignedTarget:
+-        type: number
+-        format: double
+-        minimum: 0
+-        maximum: 1
+-        description: |
+-          Raw average pairwise cosine distance targeted for this group. Low groups target the achievable minimum, medium groups the pool mean, and high groups whatever the remaining budget allows. Omitted when participant embedding fails.
+-      achievedDiversity:
+-        type: number
+-        format: double
+-        minimum: 0
+-        maximum: 2
+-        description: |
+-          Raw average pairwise cosine distance achieved by the group. Omitted when participant embedding fails.
+       diffusionStatement:
+         type: string
+         description: |
+           Statement selected to be distant from every group member using a maximin cosine-distance rule. FALLBACK STATEMENT is returned when statement selection is unavailable.
+-      fallbackUsed:
+-        type: boolean
+-        description: Whether textGroupMatch used any documented fallback behavior.
+     additionalProperties: true
+ 
+   HealthResponse:
+diff --git a/api/tests/test_main.py b/api/tests/test_main.py
+index fed094d..4f93682 100644
+--- a/api/tests/test_main.py
++++ b/api/tests/test_main.py
+@@ -12,7 +12,8 @@ class FakeTextMatchingService:
+         self.participant_responses = None
+         self.target_group_size = None
+ 
+-    def match(self, participant_responses, target_group_size):
++    def match(self, participant_responses, target_group_size, request=None):
++        self.request = request
+         self.participant_responses = participant_responses
+         self.target_group_size = target_group_size
+         return [
+@@ -82,20 +83,18 @@ class MatchApiTests(unittest.TestCase):
+                 "groupId": "1",
+                 "participantIds": ["a", "b", "c"],
+                 "diversityLevel": "medium",
+-                "assignedTarget": 0.5,
+-                "achievedDiversity": 0.62,
+                 "diffusionStatement": "A test statement",
+-                "fallbackUsed": False,
+             },
+         )
+ 
+-    def test_response_echoes_the_text_that_was_actually_embedded(self):
+-        """Participants who send no text get a placeholder, so the caller cannot
+-        otherwise reconstruct what the groups were built from."""
++    def test_embedded_text_is_logged_rather_than_returned(self):
++        """Participants who send no text get a placeholder. The caller used to
++        need that echoed back; it now goes to the logger instead, which is the
++        single biggest payload saving on a large event."""
+         service = FakeTextMatchingService()
+         with patch.object(
+             main, "get_text_matching_service", return_value=service
+-        ):
++        ), patch.object(main.log, "log_event") as log_event:
+             response = self.client.post(
+                 "/match",
+                 json={
+@@ -109,10 +108,86 @@ class MatchApiTests(unittest.TestCase):
+                 },
+             )
+ 
+-        echoed = response.json()["participantResponses"]
+-        self.assertEqual(echoed, service.participant_responses)
+-        self.assertEqual(echoed["a"], "supplied response")  # trimmed, as embedded
+-        self.assertTrue(echoed["b"] and echoed["c"])  # placeholders are visible
++        self.assertNotIn("participantResponses", response.json())
++
++        logged = next(
++            call.kwargs["extra_data"]
++            for call in log_event.call_args_list
++            if "responses" in call.kwargs.get("extra_data", {})
++        )
++        by_id = {entry["participant_id"]: entry for entry in logged["responses"]}
++        self.assertEqual(by_id["a"]["response"], "supplied response")
++        self.assertFalse(by_id["a"]["is_placeholder"])
++        self.assertTrue(by_id["b"]["is_placeholder"])
++        self.assertEqual(logged["placeholder_count"], 2)
++
++    def test_text_diagnostics_go_to_the_logger(self):
++        service = FakeTextMatchingService()
++        with patch.object(
++            main, "get_text_matching_service", return_value=service
++        ), patch.object(main.log, "log_event") as log_event:
++            response = self.client.post(
++                "/match",
++                json={
++                    "algorithm": "textGroupMatch",
++                    "targetGroupSize": 3,
++                    "participants": {"a": {}, "b": {}, "c": {}},
++                },
++            )
++
++        self.assertEqual(response.status_code, 200)
++        body = response.json()["results"][0]
++        for field in ("assignedTarget", "achievedDiversity", "fallbackUsed"):
++            self.assertNotIn(field, body)
++
++        call = next(
++            call
++            for call in log_event.call_args_list
++            if call.kwargs.get("extra_data", {}).get("algorithm") == "textGroupMatch"
++        )
++        extra = call.kwargs["extra_data"]
++        logged_group = extra["groups"][0]
++        self.assertEqual(logged_group["assignedTarget"], 0.5)
++        self.assertEqual(logged_group["achievedDiversity"], 0.62)
++        self.assertIs(logged_group["fallbackUsed"], False)
++        self.assertEqual(extra["condition_counts"], {"medium": 1})
++        self.assertEqual(call.kwargs["request"].url.path, "/match")
++
++    def test_thin_high_arm_is_flagged(self):
++        service = FakeTextMatchingService()
++        with patch.object(
++            main, "get_text_matching_service", return_value=service
++        ), patch.object(main.log, "log_event") as log_event:
++            self.client.post(
++                "/match",
++                json={
++                    "algorithm": "textGroupMatch",
++                    "targetGroupSize": 3,
++                    "participants": {"a": {}, "b": {}, "c": {}},
++                },
++            )
++
++        warnings = [
++            call
++            for call in log_event.call_args_list
++            if call.args and call.args[0] == "WARNING"
++        ]
++        self.assertTrue(
++            any("high" in call.args[1] for call in warnings),
++            "a high arm below two groups should be flagged",
++        )
++
++    def test_group_size_report_flags_a_plan_mismatch(self):
++        report = main._group_size_report(100, 5, [5] * 20)
++        self.assertEqual(report["group_count"], 20)
++        self.assertEqual(report["planned_group_count"], 20)
++        self.assertTrue(report["matches_plan"])
++        self.assertTrue(report["all_participants_assigned"])
++
++        dropped = main._group_size_report(100, 5, [5] * 19)
++        self.assertFalse(dropped["matches_plan"])
++        self.assertFalse(dropped["all_participants_assigned"])
++        self.assertEqual(dropped["participants_assigned"], 95)
+ 
+     def test_text_algorithm_requires_three_participants(self):
+         response = self.client.post(
+diff --git a/api/text_match.py b/api/text_match.py
+index 731d17b..6c8e6e4 100644
+--- a/api/text_match.py
++++ b/api/text_match.py
+@@ -7,7 +7,7 @@ import random
+ import threading
+ import time
+ from collections.abc import Sequence
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ from itertools import combinations
+ from typing import Literal, Protocol
+ 
+@@ -114,6 +114,12 @@ class DiversityOptimizationResult:
+     achieved_diversities: list[float]
+     assigned_targets: list[float]
+     diversity_levels: list[DiversityLevel]
++    # Pool geometry the targets were derived from. Carried out so it can be
++    # logged: r* = (ceiling - mean) / (mean - floor) is what decides whether
++    # LOW_TO_HIGH_RATIO is set anywhere near right, and it can only be measured
++    # against real pools.
++    pool_mean_diversity: float = 0.0
++    bounds_by_size: dict[int, tuple[float, float]] = field(default_factory=dict)
+ 
+ 
+ def placeholder_responses(participant_ids: Sequence[str]) -> dict[str, str]:
+@@ -481,6 +487,60 @@ def optimize_diversity_groups(
+         achieved_diversities=best_scores,
+         assigned_targets=assigned_targets,
+         diversity_levels=diversity_levels,
++        pool_mean_diversity=pool_mean_distance(distances),
++        bounds_by_size=bounds_by_size,
++    )
++
++
++def _log_pool_geometry(
++    optimization: DiversityOptimizationResult,
++    request=None,
++) -> None:
++    """Log the distance geometry each event's targets were derived from.
++
++    HIGH_ARM_FRACTION and LOW_TO_HIGH_RATIO were set against one distance
++    distribution. r_star is the ratio at which the achievable ceiling starts
++    binding, so extra low groups stop buying contrast beyond it; logging it per
++    event is what lets those constants be set from measured pools instead.
++    """
++    mean = optimization.pool_mean_diversity
++    bounds = {
++        str(size): {"floor": low, "ceiling": high}
++        for size, (low, high) in optimization.bounds_by_size.items()
++    }
++    r_star_by_size = {}
++    for size, (low, high) in optimization.bounds_by_size.items():
++        headroom = mean - low
++        if headroom > 1e-9:
++            r_star_by_size[str(size)] = (
++                high * HIGH_ARM_CEILING_MARGIN - mean
++            ) / headroom
++
++    level_counts: dict[str, int] = {}
++    for level in optimization.diversity_levels:
++        level_counts[level] = level_counts.get(level, 0) + 1
++
++    log.log_event(
++        "INFO",
++        f"Diversity targets planned from pool mean {mean:.4f}",
++        request=request,
++        extra_data={
++            "pool_mean_diversity": mean,
++            "bounds_by_size": bounds,
++            "r_star_by_size": r_star_by_size,
++            "configured_low_to_high_ratio": LOW_TO_HIGH_RATIO,
++            "configured_high_arm_fraction": HIGH_ARM_FRACTION,
++            "arm_counts": level_counts,
++            "assigned_targets": optimization.assigned_targets,
++            "achieved_diversities": optimization.achieved_diversities,
++            "target_error": [
++                achieved - target
++                for achieved, target in zip(
++                    optimization.achieved_diversities,
++                    optimization.assigned_targets,
++                )
++            ],
++        },
+     )
+ 
+ 
+@@ -525,6 +585,7 @@ class TextMatchingService:
+         self,
+         participant_responses: dict[str, str],
+         target_group_size: int,
++        request=None,
+     ) -> list[TextMatchGroup]:
+         participant_ids = list(participant_responses)
+         group_sizes = plan_group_sizes(len(participant_ids), target_group_size)
+@@ -535,7 +596,12 @@ class TextMatchingService:
+                 list(participant_responses.values())
+             )
+         except EmbeddingServiceError as exc:
+-            log.log_event("WARNING", f"Participant embedding failed; using random fallback: {exc}", request=None)
++            log.log_event(
++                "WARNING",
++                f"Participant embedding failed; using random fallback: {exc}",
++                request=request,
++                extra_data={"participant_count": len(participant_ids)},
++            )
+             return self._fallback_groups(participant_ids, group_sizes, seed)
+ 
+         optimization = optimize_diversity_groups(
+@@ -545,6 +611,8 @@ class TextMatchingService:
+             seed=seed,
+             time_limit_seconds=self.optimization_seconds,
+         )
++        _log_pool_geometry(optimization, request)
++
+         embedding_by_id = {
+             participant_id: participant_embeddings[index]
+             for index, participant_id in enumerate(participant_ids)
+@@ -553,7 +621,11 @@ class TextMatchingService:
+         try:
+             diffusion_embeddings = self._get_diffusion_embeddings()
+         except EmbeddingServiceError as exc:
+-            log.log_event("WARNING", f"Diffusion statement embedding failed; using fallback statement: {exc}", request=None)
++            log.log_event(
++                "WARNING",
++                f"Diffusion statement embedding failed; using fallback statement: {exc}",
++                request=request,
++            )
+             return [
+                 self._build_group(optimization, index, FALLBACK_STATEMENT, True)
+                 for index in range(len(optimization.groups))
+diff --git a/demo/text.html b/demo/text.html
+index 1d852a0..cd74d18 100644
+--- a/demo/text.html
++++ b/demo/text.html
+@@ -625,20 +625,10 @@
+                     document.createTextNode(group.diffusionStatement || "Not returned")
+                 );
+ 
+-                const diagnostics = document.createElement("p");
+-                diagnostics.className = "diagnostics";
+-                diagnostics.textContent = [
+-                    `Assigned target: ${formatScore(group.assignedTarget)}`,
+-                    `Raw achieved: ${formatScore(group.achievedDiversity)}`,
+-                ].join(" · ");
+-
+-                card.append(header, members, diagnostics, diffusion);
+-                if (group.fallbackUsed) {
+-                    const fallback = document.createElement("p");
+-                    fallback.className = "fallback";
+-                    fallback.textContent = "Fallback behavior was used for this group.";
+-                    card.append(fallback);
+-                }
++                // Assigned target, achieved diversity and the fallback flag are
++                // no longer in the response - they go to Cloud Logging. The demo
++                // shows the arm label, which is all the client is given.
++                card.append(header, members, diffusion);
+                 resultsElement.append(card);
+             });
+ 
+@@ -650,10 +640,6 @@
+             statusElement.className = message ? `status visible ${type}` : "status";
+         }
+ 
+-        function formatScore(value) {
+-            return Number.isFinite(value) ? Number(value).toFixed(3) : "not available";
+-        }
+-
+         renderParticipants();
+     </script>
+ </body>
+-- 
+2.43.0
+
+
+From bb6b4ed739cc2dd8f66d71e031ffb9d2af95a5c0 Mon Sep 17 00:00:00 2001
+From: Carter Blair <cartergblair@gmail.com>
+Date: Thu, 20 Aug 2026 18:55:41 +0000
+Subject: [PATCH 2/5] feat: balance diversity arms into near-equal thirds
+
+The 2.5:1 low-to-high allocation maximized how far the budget could push the
+high target, but measured r* (where the achievable ceiling starts binding) is
+~0.3-0.5, so most of the low arm bought no contrast while the high arm ran at
+2 groups. Balanced thirds is the conservative choice under noisy measurement:
+D-optimal for a quadratic dose-response, minimax under unknown per-arm outcome
+variance, robust to losing a group per arm to fallback, and still ~1.55x the
+SNR of 5/13/2 on the ceiling-capped linear contrast (~85% of the endpoints-only
+optimum).
+
+Extreme targets are pulled in by TARGET_PULL_IN (5% of the achievable range)
+on both ends, replacing the one-sided ceiling margin, so assignment error is
+roughly symmetric instead of strictly inward.
+---
+ README.md                    |   8 +--
+ api/tests/test_text_match.py |  49 ++++++++++++-----
+ api/text_match.py            | 100 +++++++++++++++++------------------
+ 3 files changed, 89 insertions(+), 68 deletions(-)
+
+diff --git a/README.md b/README.md
+index 95e739f..60cadcd 100644
+--- a/README.md
++++ b/README.md
+@@ -95,10 +95,10 @@ Every `/match` call emits structured entries through `api/logger.py`:
+ - a group-size report comparing produced groups against `plan_group_sizes`, and
+   `condition_counts` giving the number of groups in each diversity arm.
+ - the pool geometry each event's targets were derived from: pool mean, the
+-  achievable floor and ceiling per group size, and `r_star_by_size`, the ratio
+-  at which the achievable ceiling starts binding. `LOW_TO_HIGH_RATIO` should be
+-  set from measured `r_star` values rather than from a single assumed distance
+-  distribution.
++  achievable floor and ceiling per group size, and `r_star_by_size`, the
++  low-to-high ratio at which the achievable ceiling starts binding. On the
++  synthetic pools used to set the design this was ~0.3-0.5, which is why the
++  arms are balanced rather than skewed toward a large low arm.
+ 
+ Size mismatches and unassigned participants raise `WARNING` and `ERROR`. A high
+ arm below two groups raises a `WARNING`, since the contrast is not estimable.
+diff --git a/api/tests/test_text_match.py b/api/tests/test_text_match.py
+index c5b091e..40cee66 100644
+--- a/api/tests/test_text_match.py
++++ b/api/tests/test_text_match.py
+@@ -6,8 +6,7 @@ import numpy as np
+ from embedding_client import EmbeddingServiceError
+ from text_match import (
+     FALLBACK_STATEMENT,
+-    HIGH_ARM_CEILING_MARGIN,
+-    LOW_TO_HIGH_RATIO,
++    TARGET_PULL_IN,
+     TextMatchingService,
+     cosine_distance_matrix,
+     estimate_diversity_bounds,
+@@ -62,23 +61,27 @@ class DiversityTargetTests(unittest.TestCase):
+             _, levels = plan_diversity_targets(sizes, distances, seed=8)
+             self.assertEqual(set(levels), {"low", "medium", "high"})
+ 
+-    def test_uses_thin_high_arm_funded_by_a_larger_low_arm(self):
++    def test_arms_are_balanced_thirds(self):
++        """Balanced allocation: D-optimal for a quadratic dose-response, minimax
++        under unknown per-arm variance, and no arm is one fallback from empty."""
+         distances = _distances(60)
+         sizes = [5] * 20
+         _, levels = plan_diversity_targets(sizes, distances, seed=8)
+ 
+-        self.assertEqual(levels.count("low"), 5)
+-        self.assertEqual(levels.count("high"), 2)
+-        self.assertEqual(levels.count("medium"), 13)
++        self.assertEqual(levels.count("low"), 7)
++        self.assertEqual(levels.count("medium"), 6)
++        self.assertEqual(levels.count("high"), 7)
+ 
+-    def test_low_to_high_ratio_is_stable_across_event_sizes(self):
+-        """The ratio sets the high target, so it must not drift with group count."""
+-        for group_count in (20, 24, 40, 50, 100):
++    def test_arm_counts_never_differ_by_more_than_one(self):
++        for group_count in range(3, 101):
+             low, middle, high = plan_arm_counts(group_count)
+             with self.subTest(groups=group_count):
+-                self.assertAlmostEqual(low / high, LOW_TO_HIGH_RATIO, delta=0.15)
+                 self.assertEqual(low + middle + high, group_count)
+-                self.assertGreaterEqual(middle, 1)
++                self.assertLessEqual(max(low, middle, high) - min(low, middle, high), 1)
++                self.assertGreaterEqual(min(low, middle, high), 1)
++                # extras go to the extreme arms, never the middle
++                self.assertGreaterEqual(low, middle)
++                self.assertGreaterEqual(high, middle)
+ 
+     def test_arm_counts_reject_events_too_small_for_three_levels(self):
+         with self.assertRaisesRegex(ValueError, "at least 3 groups"):
+@@ -114,12 +117,14 @@ class DiversityTargetTests(unittest.TestCase):
+             pool_mean_distance(distances) + 1e-9,
+         )
+ 
+-    def test_high_target_follows_the_budget_formula(self):
++    def test_high_target_is_budget_capped_by_the_pulled_in_ceiling(self):
+         distances = _distances(60)
+         sizes = [5] * 20
+         targets, levels = plan_diversity_targets(sizes, distances, seed=8)
+         bounds = estimate_diversity_bounds(distances, sizes, seed=8)
+         mean_diversity = pool_mean_distance(distances)
++        floor, ceiling = bounds[5]
++        margin = TARGET_PULL_IN * (ceiling - floor)
+ 
+         low = [t for t, level in zip(targets, levels) if level == "low"]
+         high = {t for t, level in zip(targets, levels) if level == "high"}
+@@ -131,10 +136,26 @@ class DiversityTargetTests(unittest.TestCase):
+ 
+         self.assertEqual(len(high), 1)
+         self.assertAlmostEqual(
+-            high.pop(),
+-            min(expected, bounds[5][1] * HIGH_ARM_CEILING_MARGIN),
++            high.pop(), min(expected, ceiling - margin)
+         )
+ 
++    def test_extreme_targets_leave_symmetric_slack(self):
++        """Targeting the exact floor or ceiling makes assignment error
++        one-sided; the pull-in keeps both extremes strictly inside bounds."""
++        distances = _distances(60)
++        sizes = [5] * 20
++        targets, levels = plan_diversity_targets(sizes, distances, seed=8)
++        bounds = estimate_diversity_bounds(distances, sizes, seed=8)
++        floor, ceiling = bounds[5]
++
++        lows = [t for t, level in zip(targets, levels) if level == "low"]
++        highs = [t for t, level in zip(targets, levels) if level == "high"]
++        self.assertTrue(all(t > floor for t in lows))
++        self.assertTrue(all(t < ceiling for t in highs))
++        margin = TARGET_PULL_IN * (ceiling - floor)
++        for t in lows:
++            self.assertAlmostEqual(t, floor + margin)
++
+     def test_targets_are_raw_distances_not_normalized(self):
+         distances = _distances(60)
+         sizes = [5] * 12
+diff --git a/api/text_match.py b/api/text_match.py
+index 6c8e6e4..e25ecdd 100644
+--- a/api/text_match.py
++++ b/api/text_match.py
+@@ -21,27 +21,31 @@ FALLBACK_STATEMENT = "FALLBACK STATEMENT"
+ MIN_TEXT_GROUP_SIZE = 3
+ EXACT_BOUND_COMBINATION_LIMIT = 20_000
+ 
+-# Group formation redistributes a fixed quantity of disagreement: choosing a
+-# partition only chooses which pairs are co-assigned, so the mean achieved
+-# diversity is pinned near the pool mean. A target set is feasible only if its
+-# mean does not exceed that, which rules out equal thirds. Homogeneous groups
+-# consume little of the budget, so they fund the diverse ones and the high target
+-# follows as mu * (1 + n_low / n_high) -- a larger low arm buys a more extreme
+-# high arm.
++# Group formation redistributes disagreement between groups, so a low arm
++# funds a further high arm (see high_arm_target). An earlier revision leaned on
++# that hard: a 2.5:1 low-to-high ratio pushing a thin high arm as far as the
++# budget allowed. Two problems, both measured on synthetic pools: the
++# achievable ceiling binds at a low-to-high ratio of roughly 0.3-0.5, long
++# before a 2.5 budget does, so most of the extra low groups bought no
++# additional contrast; and a 2-group arm has no usable within-arm variance and
++# is one embedding fallback away from vanishing.
+ #
+-# The ratio below is PROVISIONAL. The direction (more low than high) follows from
+-# the budget, but the magnitude was chosen against one distance distribution and
+-# may not suit the deployed embedding's: how much headroom a pool has above
+-# versus below its mean varies a lot between metrics, and when the achievable
+-# ceiling binds before the budget does, a wider high arm is better than a
+-# further one. Revisit once a real pool's geometry has been measured.
+-HIGH_ARM_FRACTION = 0.10
+-LOW_TO_HIGH_RATIO = 2.5
+-# Leave the optimizer slack instead of targeting the estimated ceiling exactly.
+-HIGH_ARM_CEILING_MARGIN = 0.97
+-# Below this many groups a three-level design is not identifiable. Every group is
+-# targeted at the pool mean instead, which still improves on random assignment by
+-# removing scatter rather than by shifting the mean.
++# The allocation is therefore balanced: near-equal thirds. That choice is
++# deliberately conservative rather than contrast-maximal:
++# - it is the D-optimal design for a quadratic dose-response on three support
++#   points, so an inverted-U (too much diversity harming deliberation) is
++#   detectable rather than assumed away;
++# - with unknown, possibly unequal outcome variance across arms, equal
++#   allocation is the minimax choice;
++# - every arm can lose a group to fallback and still be estimable.
++# Against the ceiling-capped contrast this costs ~15% SNR versus the
++# endpoints-only optimum, and gains ~55% over the old 5/13/2 split.
++#
++# Targets are pulled in from the achievable extremes by TARGET_PULL_IN of the
++# range. Targeting the exact floor or ceiling means the optimizer can only miss
++# inward, which makes assignment error one-sided; a symmetric margin keeps the
++# error roughly centered and the extreme arms reliably reachable.
++TARGET_PULL_IN = 0.05
+ MIN_GROUPS_FOR_LEVELS = 3
+ 
+ DUMMY_PARTICIPANT_STATEMENTS = (
+@@ -115,9 +119,9 @@ class DiversityOptimizationResult:
+     assigned_targets: list[float]
+     diversity_levels: list[DiversityLevel]
+     # Pool geometry the targets were derived from. Carried out so it can be
+-    # logged: r* = (ceiling - mean) / (mean - floor) is what decides whether
+-    # LOW_TO_HIGH_RATIO is set anywhere near right, and it can only be measured
+-    # against real pools.
++    # logged: r* = (ceiling - mean) / (mean - floor) locates where the
++    # achievable ceiling starts binding, and it can only be measured against
++    # real pools.
+     pool_mean_diversity: float = 0.0
+     bounds_by_size: dict[int, tuple[float, float]] = field(default_factory=dict)
+ 
+@@ -206,27 +210,19 @@ def pool_mean_distance(distances: np.ndarray) -> float:
+ 
+ 
+ def plan_arm_counts(group_count: int) -> tuple[int, int, int]:
+-    """How many groups go in the low, middle and high arms.
++    """Near-equal thirds: (low, middle, high), extras to low then high.
+ 
+-    Pure arithmetic on the group count -- no distances involved. The low arm is
+-    derived from the high arm rather than rounding both against the group count,
+-    so that n_low / n_high, which is what sets the high target, stays put instead
+-    of drifting with event size.
++    Pure arithmetic on the group count -- no distances involved. Extras go to
++    the extreme arms: an extra low group relaxes the diversity budget, an extra
++    high group adds precision where outcome variance is most suspect.
+     """
+     if group_count < MIN_GROUPS_FOR_LEVELS:
+         raise ValueError(
+             f"three arms require at least {MIN_GROUPS_FOR_LEVELS} groups"
+         )
+-
+-    high_count = max(1, round(group_count * HIGH_ARM_FRACTION))
+-    low_count = max(1, round(high_count * LOW_TO_HIGH_RATIO))
+-    while low_count + high_count >= group_count:
+-        if low_count > 1:
+-            low_count -= 1
+-        elif high_count > 1:
+-            high_count -= 1
+-        else:  # pragma: no cover - unreachable for group_count >= 3
+-            break
++    base, extras = divmod(group_count, 3)
++    low_count = base + (1 if extras >= 1 else 0)
++    high_count = base + (1 if extras >= 2 else 0)
+     return low_count, group_count - low_count - high_count, high_count
+ 
+ 
+@@ -287,8 +283,13 @@ def plan_diversity_targets(
+     )
+     random.Random(seed ^ 0xD1A3E571).shuffle(arms)
+ 
++    def pulled_bounds(size: int) -> tuple[float, float]:
++        floor, ceiling = bounds_by_size[size]
++        margin = TARGET_PULL_IN * (ceiling - floor)
++        return floor + margin, ceiling - margin
++
+     low_targets = {
+-        index: bounds_by_size[sizes[index]][0]
++        index: pulled_bounds(sizes[index])[0]
+         for index, arm in enumerate(arms)
+         if arm == "low"
+     }
+@@ -303,7 +304,7 @@ def plan_diversity_targets(
+         elif arm == "medium":
+             targets.append(mean_diversity)
+         else:
+-            ceiling = bounds_by_size[sizes[index]][1] * HIGH_ARM_CEILING_MARGIN
++            ceiling = pulled_bounds(sizes[index])[1]
+             targets.append(max(mean_diversity, min(high_target, ceiling)))
+     return targets, arms
+ 
+@@ -498,10 +499,11 @@ def _log_pool_geometry(
+ ) -> None:
+     """Log the distance geometry each event's targets were derived from.
+ 
+-    HIGH_ARM_FRACTION and LOW_TO_HIGH_RATIO were set against one distance
+-    distribution. r_star is the ratio at which the achievable ceiling starts
+-    binding, so extra low groups stop buying contrast beyond it; logging it per
+-    event is what lets those constants be set from measured pools instead.
++    r_star is the low-to-high ratio at which the achievable ceiling starts
++    binding, so low groups beyond it stop buying contrast. The balanced
++    allocation sits near 1; logging r_star per event verifies against real
++    pools that the ceiling, not the budget, is the binding constraint there
++    too, and by how much.
+     """
+     mean = optimization.pool_mean_diversity
+     bounds = {
+@@ -510,11 +512,10 @@ def _log_pool_geometry(
+     }
+     r_star_by_size = {}
+     for size, (low, high) in optimization.bounds_by_size.items():
+-        headroom = mean - low
++        margin = TARGET_PULL_IN * (high - low)
++        headroom = mean - (low + margin)
+         if headroom > 1e-9:
+-            r_star_by_size[str(size)] = (
+-                high * HIGH_ARM_CEILING_MARGIN - mean
+-            ) / headroom
++            r_star_by_size[str(size)] = (high - margin - mean) / headroom
+ 
+     level_counts: dict[str, int] = {}
+     for level in optimization.diversity_levels:
+@@ -528,8 +529,7 @@ def _log_pool_geometry(
+             "pool_mean_diversity": mean,
+             "bounds_by_size": bounds,
+             "r_star_by_size": r_star_by_size,
+-            "configured_low_to_high_ratio": LOW_TO_HIGH_RATIO,
+-            "configured_high_arm_fraction": HIGH_ARM_FRACTION,
++            "configured_target_pull_in": TARGET_PULL_IN,
+             "arm_counts": level_counts,
+             "assigned_targets": optimization.assigned_targets,
+             "achieved_diversities": optimization.achieved_diversities,
+-- 
+2.43.0
+
+
+From 7fa07f2a9af3d329b7fc75d6080a02f144e6bc7e Mon Sep 17 00:00:00 2001
+From: Carter Blair <cartergblair@gmail.com>
+Date: Fri, 21 Aug 2026 00:32:28 +0000
+Subject: [PATCH 3/5] feat: REQUIRE_REAL_TEXT strict mode refuses placeholder
+ substitution
+
+Groups formed from placeholder text achieve their diversity targets perfectly
+and demonstrate nothing about the participants. At a one-shot live event that
+failure is silent and unrecoverable. With REQUIRE_REAL_TEXT=1 the API instead
+returns 422 MISSING_TEXT_RESPONSES listing the affected participant ids, so a
+broken survey pipeline is caught at the pre-event dry run instead of after
+matching.
+---
+ api/main.py            | 36 +++++++++++++++++++++++++++++++++++
+ api/tests/test_main.py | 43 ++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 79 insertions(+)
+
+diff --git a/api/main.py b/api/main.py
+index 27727c5..23349bc 100644
+--- a/api/main.py
++++ b/api/main.py
+@@ -2,6 +2,7 @@ from __future__ import annotations
+ 
+ from functools import lru_cache
+ from pathlib import Path
++import os
+ import random
+ import re
+ from typing import Literal, Optional
+@@ -111,6 +112,14 @@ class MatchResponse(BaseModel):
+     # diagnostic rather than something the client acts on, so it is logged now.
+ 
+ 
++class MissingTextResponses(Exception):
++    def __init__(self, participant_ids: list[str]):
++        self.participant_ids = participant_ids
++        super().__init__(
++            f"{len(participant_ids)} participant(s) have no freeTextResponse"
++        )
++
++
+ # ---------------------------------------------------------------------------
+ # Error handling
+ # ---------------------------------------------------------------------------
+@@ -130,6 +139,25 @@ def _error(code: str, message: str, status: int) -> JSONResponse:
+     return JSONResponse({"code": code, "message": message}, status_code=status)
+ 
+ 
++@app.exception_handler(MissingTextResponses)
++async def missing_text_handler(request: Request, exc: MissingTextResponses) -> JSONResponse:
++    log.log_event(
++        "ERROR",
++        f"Refusing to match: {len(exc.participant_ids)} participant(s) "
++        f"missing freeTextResponse and REQUIRE_REAL_TEXT is set",
++        request=request,
++        extra_data={"participant_ids_missing_text": exc.participant_ids},
++    )
++    return JSONResponse(
++        {
++            "code": "MISSING_TEXT_RESPONSES",
++            "message": "freeTextResponse missing or empty for: "
++            + ", ".join(exc.participant_ids),
++        },
++        status_code=422,
++    )
++
++
+ @app.exception_handler(RequestValidationError)
+ async def validation_exception_handler(
+     request: Request,
+@@ -177,6 +205,14 @@ def _text_responses(
+         responses[participant_id] = supplied or placeholders[participant_id]
+ 
+     placeholder_set = set(placeholder_ids)
++    # One-shot-event protection: groups formed from placeholder text are
++    # meaningless but look statistically perfect, so a silent substitution at a
++    # live event would burn the only demonstration. Strict mode turns the silent
++    # fallback into a loud, listable refusal. Enable REQUIRE_REAL_TEXT=1 in the
++    # deployed environment for real events; leave off for demos and tests.
++    if placeholder_ids and os.getenv("REQUIRE_REAL_TEXT", "").lower() in {"1", "true", "yes"}:
++        raise MissingTextResponses(placeholder_ids)
++
+     log.log_event(
+         "INFO",
+         f"Collected {len(responses)} participant responses "
+diff --git a/api/tests/test_main.py b/api/tests/test_main.py
+index 4f93682..49b45b3 100644
+--- a/api/tests/test_main.py
++++ b/api/tests/test_main.py
+@@ -189,6 +189,49 @@ class MatchApiTests(unittest.TestCase):
+         self.assertFalse(dropped["all_participants_assigned"])
+         self.assertEqual(dropped["participants_assigned"], 95)
+ 
++    def test_strict_mode_refuses_placeholder_substitution(self):
++        """At a live event, groups built from placeholder text would look
++        statistically perfect and mean nothing. REQUIRE_REAL_TEXT turns the
++        silent substitution into a listable 422."""
++        service = FakeTextMatchingService()
++        with patch.object(
++            main, "get_text_matching_service", return_value=service
++        ), patch.dict(main.os.environ, {"REQUIRE_REAL_TEXT": "1"}):
++            response = self.client.post(
++                "/match",
++                json={
++                    "algorithm": "textGroupMatch",
++                    "targetGroupSize": 3,
++                    "participants": {
++                        "a": {"freeTextResponse": "real text"},
++                        "b": {},
++                        "c": {"freeTextResponse": "   "},
++                    },
++                },
++            )
++        self.assertEqual(response.status_code, 422)
++        body = response.json()
++        self.assertEqual(body["code"], "MISSING_TEXT_RESPONSES")
++        self.assertIn("b", body["message"])
++        self.assertIn("c", body["message"])
++        self.assertIsNone(service.participant_responses)
++
++    def test_strict_mode_off_keeps_placeholder_fallback(self):
++        service = FakeTextMatchingService()
++        with patch.object(
++            main, "get_text_matching_service", return_value=service
++        ), patch.dict(main.os.environ, {}, clear=False):
++            main.os.environ.pop("REQUIRE_REAL_TEXT", None)
++            response = self.client.post(
++                "/match",
++                json={
++                    "algorithm": "textGroupMatch",
++                    "targetGroupSize": 3,
++                    "participants": {"a": {}, "b": {}, "c": {}},
++                },
++            )
++        self.assertEqual(response.status_code, 200)
++
+     def test_text_algorithm_requires_three_participants(self):
+         response = self.client.post(
+             "/match",
+-- 
+2.43.0
+
+
+From 5dc83496fe58f7daaa315c0ea5f538b999bcb32a Mon Sep 17 00:00:00 2001
+From: Carter Blair <cartergblair@gmail.com>
+Date: Sat, 22 Aug 2026 00:38:34 +0000
+Subject: [PATCH 4/5] feat: allocate arms sqrt(2):1:1 for the curvature
+ contrast
+
+The confirmatory analysis is now the curvature contrast 2M - L - H (interior
+optimum), with the linear contrast H - L registered separately. sqrt(2):1:1
+minimises the larger marginal variance of the medium-versus-extreme
+comparisons and sits within a few percent of the variance-minimising
+allocation for the curvature contrast, while keeping the extreme arms large
+enough to keep the linear contrast informative: 6/8/6 at 20 groups, 7/11/7 at
+25, matching the reviewed design note.
+
+Extreme arms are held equal so that sum(c1_i * c2_i / n_i) == 0 for the linear
+and quadratic contrasts -- the two registered hypotheses are then exactly
+orthogonal and neither borrows evidence from the other.
+---
+ README.md                    | 11 ++++++---
+ api/tests/test_text_match.py | 43 ++++++++++++++++++++++-----------
+ api/text_match.py            | 46 +++++++++++++++++++++---------------
+ 3 files changed, 64 insertions(+), 36 deletions(-)
+
+diff --git a/README.md b/README.md
+index 60cadcd..52653d3 100644
+--- a/README.md
++++ b/README.md
+@@ -96,9 +96,14 @@ Every `/match` call emits structured entries through `api/logger.py`:
+   `condition_counts` giving the number of groups in each diversity arm.
+ - the pool geometry each event's targets were derived from: pool mean, the
+   achievable floor and ceiling per group size, and `r_star_by_size`, the
+-  low-to-high ratio at which the achievable ceiling starts binding. On the
+-  synthetic pools used to set the design this was ~0.3-0.5, which is why the
+-  arms are balanced rather than skewed toward a large low arm.
++  low-to-high ratio at which the achievable ceiling starts binding.
++
++Groups are allocated to diversity arms as `sqrt(2) : 1 : 1`
++(medium : low : high) -- 6 / 8 / 6 at 20 groups, 7 / 11 / 7 at 25. This
++minimises the larger marginal variance of the medium-versus-extreme
++comparisons that the confirmatory curvature contrast `2M - L - H` depends on,
++and keeping the extreme arms equal makes the linear and quadratic contrasts
++exactly orthogonal.
+ 
+ Size mismatches and unassigned participants raise `WARNING` and `ERROR`. A high
+ arm below two groups raises a `WARNING`, since the contrast is not estimable.
+diff --git a/api/tests/test_text_match.py b/api/tests/test_text_match.py
+index 40cee66..3622055 100644
+--- a/api/tests/test_text_match.py
++++ b/api/tests/test_text_match.py
+@@ -6,6 +6,7 @@ import numpy as np
+ from embedding_client import EmbeddingServiceError
+ from text_match import (
+     FALLBACK_STATEMENT,
++    MEDIUM_ARM_WEIGHT,
+     TARGET_PULL_IN,
+     TextMatchingService,
+     cosine_distance_matrix,
+@@ -61,27 +62,40 @@ class DiversityTargetTests(unittest.TestCase):
+             _, levels = plan_diversity_targets(sizes, distances, seed=8)
+             self.assertEqual(set(levels), {"low", "medium", "high"})
+ 
+-    def test_arms_are_balanced_thirds(self):
+-        """Balanced allocation: D-optimal for a quadratic dose-response, minimax
+-        under unknown per-arm variance, and no arm is one fallback from empty."""
++    def test_allocates_sqrt_two_to_one_to_one(self):
++        """Medium arm is sqrt(2)x an extreme arm: minimises the larger marginal
++        variance of the medium-versus-extreme contrasts, which the confirmatory
++        curvature test depends on."""
+         distances = _distances(60)
+         sizes = [5] * 20
+         _, levels = plan_diversity_targets(sizes, distances, seed=8)
+ 
+-        self.assertEqual(levels.count("low"), 7)
+-        self.assertEqual(levels.count("medium"), 6)
+-        self.assertEqual(levels.count("high"), 7)
++        self.assertEqual(levels.count("low"), 6)
++        self.assertEqual(levels.count("medium"), 8)
++        self.assertEqual(levels.count("high"), 6)
+ 
+-    def test_arm_counts_never_differ_by_more_than_one(self):
++    def test_reproduces_the_published_allocation_at_25_groups(self):
++        self.assertEqual(plan_arm_counts(25), (7, 11, 7))
++
++    def test_extreme_arms_stay_equal_so_contrasts_are_orthogonal(self):
++        """Linear (-1, 0, 1) and quadratic (-1, 2, -1) contrasts are orthogonal
++        iff sum(c1_i * c2_i / n_i) == 0, which holds exactly when the extreme
++        arms are equal. The two registered hypotheses must stay independent."""
+         for group_count in range(3, 101):
+             low, middle, high = plan_arm_counts(group_count)
+             with self.subTest(groups=group_count):
++                self.assertEqual(low, high)
+                 self.assertEqual(low + middle + high, group_count)
+-                self.assertLessEqual(max(low, middle, high) - min(low, middle, high), 1)
+-                self.assertGreaterEqual(min(low, middle, high), 1)
+-                # extras go to the extreme arms, never the middle
+-                self.assertGreaterEqual(low, middle)
+-                self.assertGreaterEqual(high, middle)
++                self.assertGreaterEqual(middle, 1)
++                self.assertGreaterEqual(low, 1)
++                orthogonality = 1.0 / low - 1.0 / high
++                self.assertAlmostEqual(orthogonality, 0.0)
++
++    def test_medium_arm_tracks_the_sqrt_two_weight_at_scale(self):
++        for group_count in (30, 60, 100):
++            low, middle, high = plan_arm_counts(group_count)
++            with self.subTest(groups=group_count):
++                self.assertAlmostEqual(middle / low, MEDIUM_ARM_WEIGHT, delta=0.12)
+ 
+     def test_arm_counts_reject_events_too_small_for_three_levels(self):
+         with self.assertRaisesRegex(ValueError, "at least 3 groups"):
+@@ -234,8 +248,9 @@ class DiversityOptimizationTests(unittest.TestCase):
+             ],
+             participant_ids,
+         )
+-        self.assertEqual(result.diversity_levels.count("low"), 2)
+-        self.assertEqual(result.diversity_levels.count("medium"), 1)
++        # 4 groups -> sqrt(2):1:1 rounds to 1 low / 2 medium / 1 high
++        self.assertEqual(result.diversity_levels.count("low"), 1)
++        self.assertEqual(result.diversity_levels.count("medium"), 2)
+         self.assertEqual(result.diversity_levels.count("high"), 1)
+ 
+         by_target = sorted(
+diff --git a/api/text_match.py b/api/text_match.py
+index e25ecdd..78ba16f 100644
+--- a/api/text_match.py
++++ b/api/text_match.py
+@@ -30,23 +30,31 @@ EXACT_BOUND_COMBINATION_LIMIT = 20_000
+ # additional contrast; and a 2-group arm has no usable within-arm variance and
+ # is one embedding fallback away from vanishing.
+ #
+-# The allocation is therefore balanced: near-equal thirds. That choice is
+-# deliberately conservative rather than contrast-maximal:
+-# - it is the D-optimal design for a quadratic dose-response on three support
+-#   points, so an inverted-U (too much diversity harming deliberation) is
+-#   detectable rather than assumed away;
+-# - with unknown, possibly unequal outcome variance across arms, equal
+-#   allocation is the minimax choice;
+-# - every arm can lose a group to fallback and still be estimable.
+-# Against the ceiling-capped contrast this costs ~15% SNR versus the
+-# endpoints-only optimum, and gains ~55% over the old 5/13/2 split.
++# The allocation now follows the confirmatory test. The primary analysis is the
++# curvature contrast 2M - L - H (an interior optimum in deliberation quality,
++# per the study's theoretical motivation), with the linear contrast H - L as a
++# separately registered hypothesis. Allocating sqrt(2) : 1 : 1
++# (medium : low : high) minimises the larger marginal variance of the
++# medium-versus-extreme comparisons and lands within a few percent of the
++# variance-minimising allocation for the curvature contrast itself, while
++# keeping the extreme arms large enough for the linear contrast to stay
++# informative. At 20 groups this is 6 / 8 / 6; at 25 groups, 7 / 11 / 7.
+ #
++# Keeping n_low == n_high is not cosmetic: it makes the linear and quadratic
++# contrasts exactly orthogonal (sum of c1_i * c2_i / n_i == 0), so the two
++# registered hypotheses are statistically independent and neither borrows
++# evidence from the other.
++MEDIUM_ARM_WEIGHT = 2 ** 0.5
++# Below this many groups a three-level design is not identifiable. Every group
++# is targeted at the pool mean instead, which still improves on random
++# assignment by removing scatter rather than by shifting the mean.
++MIN_GROUPS_FOR_LEVELS = 3
++
+ # Targets are pulled in from the achievable extremes by TARGET_PULL_IN of the
+ # range. Targeting the exact floor or ceiling means the optimizer can only miss
+ # inward, which makes assignment error one-sided; a symmetric margin keeps the
+ # error roughly centered and the extreme arms reliably reachable.
+ TARGET_PULL_IN = 0.05
+-MIN_GROUPS_FOR_LEVELS = 3
+ 
+ DUMMY_PARTICIPANT_STATEMENTS = (
+     "Public transit should be free in major cities.",
+@@ -210,20 +218,20 @@ def pool_mean_distance(distances: np.ndarray) -> float:
+ 
+ 
+ def plan_arm_counts(group_count: int) -> tuple[int, int, int]:
+-    """Near-equal thirds: (low, middle, high), extras to low then high.
++    """Allocate groups to arms as sqrt(2) : 1 : 1 (medium : low : high).
+ 
+-    Pure arithmetic on the group count -- no distances involved. Extras go to
+-    the extreme arms: an extra low group relaxes the diversity budget, an extra
+-    high group adds precision where outcome variance is most suspect.
++    Pure arithmetic on the group count -- no distances involved. The extreme
++    arms are kept equal so the linear and quadratic contrasts stay orthogonal;
++    the medium arm takes the remainder. Returns (low, middle, high).
+     """
+     if group_count < MIN_GROUPS_FOR_LEVELS:
+         raise ValueError(
+             f"three arms require at least {MIN_GROUPS_FOR_LEVELS} groups"
+         )
+-    base, extras = divmod(group_count, 3)
+-    low_count = base + (1 if extras >= 1 else 0)
+-    high_count = base + (1 if extras >= 2 else 0)
+-    return low_count, group_count - low_count - high_count, high_count
++    extreme = max(1, round(group_count / (2.0 + MEDIUM_ARM_WEIGHT)))
++    while group_count - 2 * extreme < 1:
++        extreme -= 1
++    return extreme, group_count - 2 * extreme, extreme
+ 
+ 
+ def high_arm_target(
+-- 
+2.43.0
+
+
+From 6324e64adf004072f1e484cb2c94e11e14f0dda8 Mon Sep 17 00:00:00 2001
+From: Carter Blair <cartergblair@gmail.com>
+Date: Sat, 22 Aug 2026 01:00:33 +0000
+Subject: [PATCH 5/5] docs: state the arm-allocation trade-off honestly
+
+The sqrt(2):1:1 allocation does not follow from the curvature contrast being
+primary -- that contrast alone is minimised by 2:1:1 (5/10/5 at 20 groups).
+sqrt(2):1:1 is a compromise across the three quantities the analysis plan
+commits to, and it costs the primary about 1.7 points of power to gain about
+5.3 on the linear contrast. Record the numbers rather than implying a single
+optimum.
+---
+ README.md         | 13 ++++++++-----
+ api/text_match.py | 26 +++++++++++++++++---------
+ 2 files changed, 25 insertions(+), 14 deletions(-)
+
+diff --git a/README.md b/README.md
+index 52653d3..8116b46 100644
+--- a/README.md
++++ b/README.md
+@@ -99,11 +99,14 @@ Every `/match` call emits structured entries through `api/logger.py`:
+   low-to-high ratio at which the achievable ceiling starts binding.
+ 
+ Groups are allocated to diversity arms as `sqrt(2) : 1 : 1`
+-(medium : low : high) -- 6 / 8 / 6 at 20 groups, 7 / 11 / 7 at 25. This
+-minimises the larger marginal variance of the medium-versus-extreme
+-comparisons that the confirmatory curvature contrast `2M - L - H` depends on,
+-and keeping the extreme arms equal makes the linear and quadratic contrasts
+-exactly orthogonal.
++(medium : low : high) -- 6 / 8 / 6 at 20 groups, 7 / 11 / 7 at 25. This is a
++compromise, not a single optimum: the primary curvature contrast `2M - L - H`
++alone would want `2 : 1 : 1`, the pairwise `M - H` comparison wants
++`sqrt(2) : 1 : 1`, and the linear contrast `H - L` wants fatter extreme arms.
++Relative to allocating purely for the primary, this costs about 1.7 points of
++power on the curvature test and returns about 5.3 on the linear one. Keeping
++the extreme arms equal makes the linear and quadratic contrasts exactly
++orthogonal.
+ 
+ Size mismatches and unassigned participants raise `WARNING` and `ERROR`. A high
+ arm below two groups raises a `WARNING`, since the contrast is not estimable.
+diff --git a/api/text_match.py b/api/text_match.py
+index 78ba16f..d1652ab 100644
+--- a/api/text_match.py
++++ b/api/text_match.py
+@@ -30,15 +30,23 @@ EXACT_BOUND_COMBINATION_LIMIT = 20_000
+ # additional contrast; and a 2-group arm has no usable within-arm variance and
+ # is one embedding fallback away from vanishing.
+ #
+-# The allocation now follows the confirmatory test. The primary analysis is the
+-# curvature contrast 2M - L - H (an interior optimum in deliberation quality,
+-# per the study's theoretical motivation), with the linear contrast H - L as a
+-# separately registered hypothesis. Allocating sqrt(2) : 1 : 1
+-# (medium : low : high) minimises the larger marginal variance of the
+-# medium-versus-extreme comparisons and lands within a few percent of the
+-# variance-minimising allocation for the curvature contrast itself, while
+-# keeping the extreme arms large enough for the linear contrast to stay
+-# informative. At 20 groups this is 6 / 8 / 6; at 25 groups, 7 / 11 / 7.
++# The allocation is a deliberate compromise across the three quantities the
++# analysis plan commits to, which have three different optimal allocations:
++#
++#   curvature contrast 2M - L - H (primary)   -> 2 : 1 : 1   (5/10/5 at G=20)
++#   pairwise M - H (needed for the strong
++#     "medium is best" claim, and for M - L)  -> sqrt(2) : 1 : 1  (6/8/6)
++#   linear contrast H - L (registered hedge)  -> fatter extremes still
++#
++# sqrt(2) : 1 : 1 sits between them. Measured cost against allocating purely
++# for the primary (5/10/5), at a true medium advantage of 1.0 group-outcome SD:
++# curvature power 67.5% vs 69.2% (-1.7 points), M - H discrimination 41.4% vs
++# 40.6%, linear contrast 37.3% vs 32.0% (+5.3 points). The 1.7-point loss on
++# the primary buys more than three times that back on the other two. Five
++# groups per extreme arm is also one dissolved group away from four, and the
++# extreme arms carry the dose contrast.
++#
++# At 20 groups this is 6 / 8 / 6; at 25 groups, 7 / 11 / 7.
+ #
+ # Keeping n_low == n_high is not cosmetic: it makes the linear and quadratic
+ # contrasts exactly orthogonal (sum of c1_i * c2_i / n_i == 0), so the two
+-- 
+2.43.0
+

@@ -21,9 +21,36 @@ The HTTP API selects an algorithm through the request's `algorithm` field:
 - **`binaryGroupMatch`** — the existing binary-mask group matcher.
 - **`textGroupMatch`** — embeds free-form responses and matches groups toward numeric diversity targets.
 
-Text matching prioritizes group size before diversity. Every group contains at least three participants, and the size planner first maximizes the number of groups exactly equal to `targetGroupSize`. The matcher then estimates the achievable minimum and maximum average pairwise cosine distance for each group size.
+Text matching runs in five stages.
 
-Each group is then assigned one of three targets — low, medium, or high — as a raw cosine distance rather than a normalized value, so targets mean the same thing across events. Group formation can only redistribute the disagreement already present in the pool, so achieved diversities average to roughly the pool mean and targets have to be set within that limit: low groups target the achievable minimum, medium groups the pool mean, and the high target is whatever the remaining budget allows, capped at the achievable maximum. Roughly a quarter of groups are low and a tenth are high. Events with fewer than three groups cannot support three levels, so every group targets the pool mean. A time-bounded neighborhood search then moves each group toward its target without changing its size.
+**1. Plan.** `plan_group_sizes` maximizes the number of groups exactly equal to
+`targetGroupSize`, never smaller than three. Groups are then allocated to arms as
+`sqrt(2) : 1 : 1` (medium : low : high). Off-size groups go to the medium arm, so
+the extreme arms — which carry the contrast — stay uniform and have a single
+well-defined feasible bound each.
+
+**2. Randomize.** Participants are shuffled and split into three pools, one per
+arm. Assignment to condition is therefore exactly random; the optimizer only
+rearranges people *within* their own pool afterwards and can never decide who
+experiences which condition. This happens after embedding, so a
+`REQUIRE_REAL_TEXT` failure aborts before anyone is assigned.
+
+**3. Optimize the endpoints, minimax.** The low pool minimizes its *worst*
+group's diversity; the high pool maximizes its worst. Minimax rather than
+mean-squared error because an arm label is only meaningful if it holds for every
+group in the arm, not on average.
+
+**4. Place the medium arm.** The medium target is the midpoint of the two
+*achieved* endpoint means, so the three doses are equally spaced — which is what
+preserves the identity `beta_2 = -C/2` that the confirmatory contrast relies on.
+The medium pool is then optimized toward that value by mean-squared error.
+
+**5. Validate.** Arms are checked for overlap, and each arm reports whether its
+independent restarts agreed. Agreement is the acceptance criterion: the feasible
+floor and ceiling describe what a *single* optimally-chosen group can reach,
+which minimax cannot match when every group in the arm must clear the bar
+simultaneously. Restarts converging on the same value is the evidence that an arm
+sits at its pool's real limit rather than being stuck.
 
 Each text-matched group also receives a reusable `diffusionStatement`. The selected statement maximizes its minimum cosine distance from any member of the group.
 

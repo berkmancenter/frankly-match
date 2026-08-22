@@ -6,6 +6,8 @@ import numpy as np
 from embedding_client import EmbeddingServiceError
 from text_match import (
     FALLBACK_STATEMENT,
+    assign_sizes_to_arms,
+    design_event,
     MEDIUM_ARM_WEIGHT,
     TARGET_PULL_IN,
     TextMatchingService,
@@ -287,6 +289,150 @@ class DiversityOptimizationTests(unittest.TestCase):
         )
 
         self.assertEqual(selected, "opposite")
+
+
+
+class EventDesignTests(unittest.TestCase):
+    """The five-stage design: plan, randomise into pools, optimise endpoints
+    minimax, then place the medium arm at the achieved midpoint."""
+
+    def _pool(self, count=100, clusters=4, dimensions=48, seed=11):
+        rng = np.random.default_rng(seed)
+        centers = rng.normal(size=(clusters, dimensions))
+        embeddings = np.vstack(
+            [centers[i % clusters] + 0.8 * rng.normal(size=dimensions)
+             for i in range(count)]
+        )
+        ids = [f"p{index}" for index in range(count)]
+        return ids, cosine_distance_matrix(embeddings)
+
+    def test_reproduces_the_specified_arm_and_pool_sizes(self):
+        for participants, group_size, groups, people in (
+            (100, 5, (6, 8, 6), (30, 40, 30)),
+            (100, 4, (7, 11, 7), (28, 44, 28)),
+            (98, 5, (6, 8, 6), (30, 38, 30)),
+            (97, 5, (6, 7, 6), (30, 37, 30)),
+        ):
+            with self.subTest(participants=participants, group_size=group_size):
+                sizes = plan_group_sizes(participants, group_size)
+                by_arm = assign_sizes_to_arms(
+                    sizes, group_size, plan_arm_counts(len(sizes))
+                )
+                order = ("low", "medium", "high")
+                self.assertEqual(
+                    tuple(len(by_arm[level]) for level in order), groups
+                )
+                self.assertEqual(
+                    tuple(sum(by_arm[level]) for level in order), people
+                )
+
+    def test_ragged_group_sizes_go_to_the_medium_arm(self):
+        """Achievable bounds depend on group size, so the extreme arms -- which
+        carry the contrast -- are kept uniform."""
+        sizes = plan_group_sizes(98, 5)
+        self.assertIn(3, sizes)  # 98 = 19x5 + 3
+
+        by_arm = assign_sizes_to_arms(sizes, 5, plan_arm_counts(len(sizes)))
+        self.assertIn(3, by_arm["medium"])
+        self.assertEqual(set(by_arm["low"]), {5})
+        self.assertEqual(set(by_arm["high"]), {5})
+
+    def test_pools_are_disjoint_and_cover_everyone(self):
+        ids, distances = self._pool()
+        design = design_event(ids, distances, 4, seed=7, time_limit_seconds=2)
+
+        pooled = [pid for pool in design.pools.values() for pid in pool]
+        self.assertEqual(sorted(pooled), sorted(ids))
+        self.assertEqual(len(pooled), len(set(pooled)))
+
+    def test_no_participant_crosses_pools_during_optimisation(self):
+        """The optimiser may only rearrange within a pool. If it could move
+        people between pools, assignment to condition would stop being random."""
+        ids, distances = self._pool()
+        design = design_event(ids, distances, 4, seed=7, time_limit_seconds=2)
+
+        for arm in design.arms:
+            assigned = {pid for group in arm.groups for pid in group}
+            self.assertEqual(assigned, set(design.pools[arm.level]))
+
+    def test_randomisation_is_reproducible_from_the_seed(self):
+        ids, distances = self._pool()
+        first = design_event(ids, distances, 4, seed=7, time_limit_seconds=1)
+        second = design_event(ids, distances, 4, seed=7, time_limit_seconds=1)
+        other = design_event(ids, distances, 4, seed=8, time_limit_seconds=1)
+
+        self.assertEqual(first.pools, second.pools)
+        self.assertNotEqual(first.pools, other.pools)
+
+    def test_medium_target_is_the_midpoint_of_achieved_endpoints(self):
+        """Equal spacing is what preserves beta_2 = -C/2 for the confirmatory
+        contrast, so the midpoint must come from what the endpoints ACHIEVED."""
+        ids, distances = self._pool()
+        design = design_event(ids, distances, 4, seed=7, time_limit_seconds=2)
+
+        low = next(a for a in design.arms if a.level == "low")
+        high = next(a for a in design.arms if a.level == "high")
+        self.assertAlmostEqual(design.endpoint_low, float(np.mean(low.achieved)))
+        self.assertAlmostEqual(design.endpoint_high, float(np.mean(high.achieved)))
+        self.assertAlmostEqual(
+            design.medium_target,
+            (design.endpoint_low + design.endpoint_high) / 2,
+        )
+
+    def test_endpoints_are_ordered_and_the_medium_arm_sits_between(self):
+        ids, distances = self._pool()
+        design = design_event(ids, distances, 4, seed=7, time_limit_seconds=3)
+        means = {a.level: float(np.mean(a.achieved)) for a in design.arms}
+
+        self.assertLess(means["low"], means["medium"])
+        self.assertLess(means["medium"], means["high"])
+
+    def test_bounds_are_computed_within_each_pool(self):
+        """Not over the whole event: an arm's feasible range is set by the
+        people randomised into it, not by the roster it was drawn from."""
+        ids, distances = self._pool()
+        design = design_event(ids, distances, 4, seed=7, time_limit_seconds=2)
+
+        index_of = {pid: i for i, pid in enumerate(ids)}
+        for arm in design.arms:
+            picks = np.array([index_of[p] for p in design.pools[arm.level]])
+            sub = distances[np.ix_(picks, picks)]
+            expected = estimate_diversity_bounds(
+                sub, arm.sizes, seed=7 ^ {"low": 0xA11, "high": 0xB22}.get(arm.level, 0xC33)
+            )[max(set(arm.sizes), key=arm.sizes.count)]
+            with self.subTest(level=arm.level):
+                self.assertAlmostEqual(arm.floor, expected[0])
+                self.assertAlmostEqual(arm.ceiling, expected[1])
+
+    def test_minimax_holds_for_every_group_not_just_on_average(self):
+        """An arm label is only meaningful if it holds group by group. MSE would
+        let one group sit far off while others compensate."""
+        ids, distances = self._pool()
+        design = design_event(ids, distances, 4, seed=7, time_limit_seconds=3)
+        low = next(a for a in design.arms if a.level == "low")
+        high = next(a for a in design.arms if a.level == "high")
+        medium = next(a for a in design.arms if a.level == "medium")
+
+        self.assertLess(max(low.achieved), min(medium.achieved))
+        self.assertGreater(min(high.achieved), max(medium.achieved))
+
+    def test_convergence_is_reported_per_arm(self):
+        ids, distances = self._pool()
+        design = design_event(ids, distances, 4, seed=7, time_limit_seconds=3)
+
+        for arm in design.arms:
+            with self.subTest(level=arm.level):
+                self.assertEqual(len(arm.restart_statistics), arm.restarts_used)
+                self.assertGreaterEqual(arm.restart_spread, 0.0)
+                self.assertIsInstance(arm.converged, bool)
+
+    def test_below_three_groups_falls_back_to_a_single_level(self):
+        ids, distances = self._pool(count=8)
+        design = design_event(ids, distances, 4, seed=7, time_limit_seconds=1)
+
+        self.assertEqual([a.level for a in design.arms], ["medium"])
+        self.assertIsNone(design.arms_separated)
+        self.assertAlmostEqual(design.medium_target, design.pool_mean)
 
 
 class TextMatchingServiceTests(unittest.TestCase):
