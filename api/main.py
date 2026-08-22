@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+import os
 import random
 import re
 from typing import Literal, Optional
@@ -15,13 +16,17 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator, model_validator
 
 from match import group_match
-from text_match import TextMatchingService, placeholder_responses
+from text_match import (
+    TextMatchingService,
+    placeholder_responses,
+    plan_group_sizes,
+)
 
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 
-app = FastAPI(title="Frankly Match API", version="1.2.0")
+app = FastAPI(title="Frankly Match API", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -86,18 +91,33 @@ class MatchRequest(BaseModel):
 
 
 class GroupResult(BaseModel):
+    """Client-facing group payload.
+
+    assignedTarget, achievedDiversity and fallbackUsed are deliberately absent.
+    They are matching diagnostics, not something the client renders, and they go
+    to Google Cloud Logging as structured extra_data instead.
+    """
+
     groupId: str
     participantIds: list[str]
     diversityLevel: Optional[Literal["high", "medium", "low", "unknown"]] = None
-    assignedTarget: Optional[float] = None
-    achievedDiversity: Optional[float] = None
-    normalizedAchievedDiversity: Optional[float] = None
     diffusionStatement: Optional[str] = None
-    fallbackUsed: Optional[bool] = None
 
 
 class MatchResponse(BaseModel):
     results: list[GroupResult]
+    # participantResponses used to be returned here so a caller could see what
+    # was actually embedded when a participant supplied no freeTextResponse.
+    # That is the single largest thing in the payload on a big event, and it is
+    # diagnostic rather than something the client acts on, so it is logged now.
+
+
+class MissingTextResponses(Exception):
+    def __init__(self, participant_ids: list[str]):
+        self.participant_ids = participant_ids
+        super().__init__(
+            f"{len(participant_ids)} participant(s) have no freeTextResponse"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +137,25 @@ _CODE_HINTS = {
 def _error(code: str, message: str, status: int) -> JSONResponse:
     log.log_event("ERROR", f"Error {code}: {message}", request=None)
     return JSONResponse({"code": code, "message": message}, status_code=status)
+
+
+@app.exception_handler(MissingTextResponses)
+async def missing_text_handler(request: Request, exc: MissingTextResponses) -> JSONResponse:
+    log.log_event(
+        "ERROR",
+        f"Refusing to match: {len(exc.participant_ids)} participant(s) "
+        f"missing freeTextResponse and REQUIRE_REAL_TEXT is set",
+        request=request,
+        extra_data={"participant_ids_missing_text": exc.participant_ids},
+    )
+    return JSONResponse(
+        {
+            "code": "MISSING_TEXT_RESPONSES",
+            "message": "freeTextResponse missing or empty for: "
+            + ", ".join(exc.participant_ids),
+        },
+        status_code=422,
+    )
 
 
 @app.exception_handler(RequestValidationError)
@@ -153,23 +192,79 @@ def _normalize_masks(participants: dict[str, ParticipantData]) -> dict[str, str]
 
 def _text_responses(
     participants: dict[str, ParticipantData],
+    request: Request | None = None,
 ) -> dict[str, str]:
     placeholders = placeholder_responses(list(participants))
-    responses = {}
+    responses: dict[str, str] = {}
+    placeholder_ids: list[str] = []
     for participant_id, data in participants.items():
+        supplied = data.freeTextResponse.strip() if data.freeTextResponse else ""
         # TODO: Remove placeholder responses once freeTextResponse is guaranteed in the payload.
-        responses[participant_id] = (
-            data.freeTextResponse.strip()
-            if data.freeTextResponse and data.freeTextResponse.strip()
-            else placeholders[participant_id]
-        )
-        log.log_event(
-            "INFO",
-            "Received participant response",
-            request=None,
-            extra_data={"participant_id": participant_id, "response_length": len(responses[participant_id])},
-        )
+        if not supplied:
+            placeholder_ids.append(participant_id)
+        responses[participant_id] = supplied or placeholders[participant_id]
+
+    placeholder_set = set(placeholder_ids)
+    # One-shot-event protection: groups formed from placeholder text are
+    # meaningless but look statistically perfect, so a silent substitution at a
+    # live event would burn the only demonstration. Strict mode turns the silent
+    # fallback into a loud, listable refusal. Enable REQUIRE_REAL_TEXT=1 in the
+    # deployed environment for real events; leave off for demos and tests.
+    if placeholder_ids and os.getenv("REQUIRE_REAL_TEXT", "").lower() in {"1", "true", "yes"}:
+        raise MissingTextResponses(placeholder_ids)
+
+    log.log_event(
+        "INFO",
+        f"Collected {len(responses)} participant responses "
+        f"({len(placeholder_ids)} placeholder)",
+        request=request,
+        extra_data={
+            "participant_count": len(responses),
+            "placeholder_count": len(placeholder_ids),
+            "placeholder_participant_ids": placeholder_ids,
+            # This is what used to ride back in MatchResponse.participantResponses.
+            "responses": [
+                {
+                    "participant_id": participant_id,
+                    "response": text,
+                    "response_length": len(text),
+                    "is_placeholder": participant_id in placeholder_set,
+                }
+                for participant_id, text in responses.items()
+            ],
+        },
+    )
     return responses
+
+
+def _group_size_report(
+    participant_count: int,
+    target_group_size: int,
+    group_sizes: list[int],
+) -> dict:
+    """Compare the groups actually produced against the planned sizing."""
+    report = {
+        "participant_count": participant_count,
+        "target_group_size": target_group_size,
+        "group_count": len(group_sizes),
+        "group_sizes": group_sizes,
+        "size_histogram": {
+            str(size): group_sizes.count(size) for size in sorted(set(group_sizes))
+        },
+        "participants_assigned": sum(group_sizes),
+    }
+    try:
+        planned = plan_group_sizes(participant_count, target_group_size)
+    except ValueError:
+        planned = None
+    if planned is not None:
+        report["planned_group_count"] = len(planned)
+        report["planned_group_sizes"] = planned
+        report["matches_plan"] = sorted(planned) == sorted(group_sizes)
+    report["all_participants_assigned"] = (
+        report["participants_assigned"] == participant_count
+    )
+    return report
 
 
 @lru_cache(maxsize=1)
@@ -192,7 +287,22 @@ def match(req: MatchRequest, request: Request):
         samples = _normalize_masks(req.participants)
         groups = group_match(samples, req.targetGroupSize)
 
-        log.log_event("INFO", f"Matched {len(req.participants)} participants into {len(groups)} groups via binaryGroupMatch", request=request)
+        log.log_event(
+            "INFO",
+            f"Matched {len(req.participants)} participants into {len(groups)} "
+            f"groups via binaryGroupMatch",
+            request=request,
+            extra_data={
+                "algorithm": "binaryGroupMatch",
+                "participants": samples,
+                "groups": groups,
+                "group_sizes": _group_size_report(
+                    len(req.participants),
+                    req.targetGroupSize,
+                    [len(group) for group in groups],
+                ),
+            },
+        )
         return MatchResponse(
             results=[
                 GroupResult(groupId=str(index + 1), participantIds=group)
@@ -200,23 +310,82 @@ def match(req: MatchRequest, request: Request):
             ]
         )
 
-    participant_responses = _text_responses(req.participants)
+    participant_responses = _text_responses(req.participants, request)
     groups = get_text_matching_service().match(
         participant_responses,
         req.targetGroupSize,
+        request,
     )
-    log.log_event("INFO", f"Matched {len(req.participants)} participants into {len(groups)} groups via textMatchingService", request=request)
+
+    size_report = _group_size_report(
+        len(req.participants),
+        req.targetGroupSize,
+        [len(group.participant_ids) for group in groups],
+    )
+    # Keyed on diversity_level rather than assigned_target: targets are raw
+    # distances on the embedding's scale, so counting by target value would put
+    # every group in its own bucket. Levels are a fixed enum.
+    condition_counts: dict[str, int] = {}
+    for group in groups:
+        level = group.diversity_level
+        condition_counts[level] = condition_counts.get(level, 0) + 1
+
+    log.log_event(
+        "INFO",
+        f"Matched {len(req.participants)} participants into {len(groups)} "
+        f"groups via textGroupMatch",
+        request=request,
+        extra_data={
+            "algorithm": "textGroupMatch",
+            "group_sizes": size_report,
+            "condition_counts": condition_counts,
+            "fallback_group_count": sum(1 for group in groups if group.fallback_used),
+            "groups": [
+                {
+                    "groupId": str(index + 1),
+                    "participantIds": group.participant_ids,
+                    "diversityLevel": group.diversity_level,
+                    "assignedTarget": group.assigned_target,
+                    "achievedDiversity": group.achieved_diversity,
+                    "diffusionStatement": group.diffusion_statement,
+                    "fallbackUsed": group.fallback_used,
+                }
+                for index, group in enumerate(groups)
+            ],
+        },
+    )
+
+    if not size_report.get("matches_plan", True):
+        log.log_event(
+            "WARNING",
+            "Produced group sizes do not match the planned sizing",
+            request=request,
+            extra_data=size_report,
+        )
+    if not size_report["all_participants_assigned"]:
+        log.log_event(
+            "ERROR",
+            f"{size_report['participants_assigned']} of "
+            f"{size_report['participant_count']} participants were assigned to a group",
+            request=request,
+            extra_data=size_report,
+        )
+    if condition_counts.get("high", 0) < 2:
+        log.log_event(
+            "WARNING",
+            f"Only {condition_counts.get('high', 0)} group(s) in the high "
+            f"diversity arm; the contrast is not estimable at this event size",
+            request=request,
+            extra_data={"condition_counts": condition_counts},
+        )
+
     return MatchResponse(
         results=[
             GroupResult(
                 groupId=str(index + 1),
                 participantIds=group.participant_ids,
                 diversityLevel=group.diversity_level,
-                assignedTarget=group.assigned_target,
-                achievedDiversity=group.achieved_diversity,
-                normalizedAchievedDiversity=group.normalized_achieved_diversity,
                 diffusionStatement=group.diffusion_statement,
-                fallbackUsed=group.fallback_used,
             )
             for index, group in enumerate(groups)
         ]
