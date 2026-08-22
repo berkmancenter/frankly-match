@@ -22,10 +22,30 @@ logger = logging.getLogger(__name__)
 DiversityLevel = Literal["high", "medium", "low", "unknown"]
 FALLBACK_STATEMENT = "FALLBACK STATEMENT"
 MIN_TEXT_GROUP_SIZE = 3
-FIVE_LEVEL_GROUP_THRESHOLD = 40
 EXACT_BOUND_COMBINATION_LIMIT = 20_000
-THREE_LEVEL_TARGETS = (0.0, 0.5, 1.0)
-FIVE_LEVEL_TARGETS = (0.0, 0.25, 0.5, 0.75, 1.0)
+
+# Group formation redistributes a fixed quantity of disagreement: choosing a
+# partition only chooses which pairs are co-assigned, so the mean achieved
+# diversity is pinned near the pool mean. A target set is feasible only if its
+# mean does not exceed that, which rules out equal thirds. Homogeneous groups
+# consume little of the budget, so they fund the diverse ones and the high target
+# follows as mu * (1 + n_low / n_high) -- a larger low arm buys a more extreme
+# high arm.
+#
+# The ratio below is PROVISIONAL. The direction (more low than high) follows from
+# the budget, but the magnitude was chosen against one distance distribution and
+# may not suit the deployed embedding's: how much headroom a pool has above
+# versus below its mean varies a lot between metrics, and when the achievable
+# ceiling binds before the budget does, a wider high arm is better than a
+# further one. Revisit once a real pool's geometry has been measured.
+HIGH_ARM_FRACTION = 0.10
+LOW_TO_HIGH_RATIO = 2.5
+# Leave the optimizer slack instead of targeting the estimated ceiling exactly.
+HIGH_ARM_CEILING_MARGIN = 0.97
+# Below this many groups a three-level design is not identifiable. Every group is
+# targeted at the pool mean instead, which still improves on random assignment by
+# removing scatter rather than by shifting the mean.
+MIN_GROUPS_FOR_LEVELS = 3
 
 DUMMY_PARTICIPANT_STATEMENTS = (
     "Public transit should be free in major cities.",
@@ -87,16 +107,14 @@ class TextMatchGroup:
     diversity_level: DiversityLevel
     diffusion_statement: str
     fallback_used: bool
-    assigned_target: float
+    assigned_target: float | None
     achieved_diversity: float | None
-    normalized_achieved_diversity: float | None
 
 
 @dataclass(frozen=True)
 class DiversityOptimizationResult:
     groups: list[list[str]]
     achieved_diversities: list[float]
-    normalized_achieved_diversities: list[float]
     assigned_targets: list[float]
     diversity_levels: list[DiversityLevel]
 
@@ -168,38 +186,123 @@ def cosine_distance_matrix(embeddings: np.ndarray) -> np.ndarray:
     return distances
 
 
-def plan_diversity_targets(group_count: int, *, seed: int) -> list[float]:
+def pool_mean_distance(distances: np.ndarray) -> float:
+    """Expected diversity of a uniformly random group -- exactly, for any size.
+
+    Every pair is equally likely to be co-assigned, so the expected mean pairwise
+    distance of a random group equals the mean pairwise distance over the whole
+    pool. This is an identity, not an approximation, and it does not depend on
+    the group size.
+    """
+    matrix = np.asarray(distances, dtype=np.float64)
+    if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+        raise ValueError("distances must be a square matrix")
+    if matrix.shape[0] < 2:
+        raise ValueError("at least two participants are required")
+    return float(matrix[np.triu_indices(matrix.shape[0], k=1)].mean())
+
+
+def plan_arm_counts(group_count: int) -> tuple[int, int, int]:
+    """How many groups go in the low, middle and high arms.
+
+    Pure arithmetic on the group count -- no distances involved. The low arm is
+    derived from the high arm rather than rounding both against the group count,
+    so that n_low / n_high, which is what sets the high target, stays put instead
+    of drifting with event size.
+    """
+    if group_count < MIN_GROUPS_FOR_LEVELS:
+        raise ValueError(
+            f"three arms require at least {MIN_GROUPS_FOR_LEVELS} groups"
+        )
+
+    high_count = max(1, round(group_count * HIGH_ARM_FRACTION))
+    low_count = max(1, round(high_count * LOW_TO_HIGH_RATIO))
+    while low_count + high_count >= group_count:
+        if low_count > 1:
+            low_count -= 1
+        elif high_count > 1:
+            high_count -= 1
+        else:  # pragma: no cover - unreachable for group_count >= 3
+            break
+    return low_count, group_count - low_count - high_count, high_count
+
+
+def high_arm_target(
+    mean_diversity: float,
+    low_targets: Sequence[float],
+    high_count: int,
+) -> float:
+    """The highest target the budget allows, before the ceiling is applied.
+
+    Achieved diversities average to roughly the pool mean, so every unit of
+    diversity a low group gives up is a unit the high arm can take:
+
+        H = mu + sum(mu - low_g) / n_high
+
+    which reduces to the familiar mu * (1 + n_low / n_high) when the low arm sits
+    at zero. With equal-sized arms this caps at 2 * mu -- reaching further takes a
+    larger low arm, not a bolder request.
+    """
+    if high_count < 1:
+        raise ValueError("high_count must be at least 1")
+    freed = sum(mean_diversity - target for target in low_targets)
+    return mean_diversity + freed / high_count
+
+
+def plan_diversity_targets(
+    group_sizes: Sequence[int],
+    distances: np.ndarray,
+    *,
+    seed: int,
+    bounds_by_size: dict[int, tuple[float, float]] | None = None,
+) -> tuple[list[float], list[DiversityLevel]]:
+    """Assign a raw diversity target to each group.
+
+    Targets are raw distances on the embedding's own scale, not values
+    normalized against pool-specific bounds, so that a level means the same
+    thing in every session and results can be pooled. Low groups target the
+    achievable floor, middle groups the pool mean, and high groups whatever the
+    budget then allows, capped at the achievable ceiling.
+    """
+    sizes = list(group_sizes)
+    group_count = len(sizes)
     if group_count < 1:
         raise ValueError("at least one group is required")
 
-    if group_count == 1:
-        return [0.5]
-    if group_count == 2:
-        target_levels = (0.0, 1.0)
-    elif group_count < FIVE_LEVEL_GROUP_THRESHOLD:
-        target_levels = THREE_LEVEL_TARGETS
-    else:
-        target_levels = FIVE_LEVEL_TARGETS
+    mean_diversity = pool_mean_distance(distances)
+    if bounds_by_size is None:
+        bounds_by_size = estimate_diversity_bounds(distances, sizes, seed=seed)
 
-    base_count, remainder = divmod(group_count, len(target_levels))
-    counts = [base_count] * len(target_levels)
-    extra_order = sorted(
-        range(len(target_levels)),
-        key=lambda index: (
-            abs(target_levels[index] - 0.5),
-            -target_levels[index],
-        ),
+    if group_count < MIN_GROUPS_FOR_LEVELS:
+        # Not enough groups to identify three levels. Target every group at the
+        # pool mean; that still beats random assignment by removing scatter.
+        return [mean_diversity] * group_count, ["medium"] * group_count
+
+    low_count, middle_count, high_count = plan_arm_counts(group_count)
+    arms: list[DiversityLevel] = (
+        ["low"] * low_count + ["medium"] * middle_count + ["high"] * high_count
     )
-    for index in extra_order[:remainder]:
-        counts[index] += 1
+    random.Random(seed ^ 0xD1A3E571).shuffle(arms)
 
-    targets = [
-        target
-        for target, count in zip(target_levels, counts)
-        for _ in range(count)
-    ]
-    random.Random(seed ^ 0xD1A3E571).shuffle(targets)
-    return targets
+    low_targets = {
+        index: bounds_by_size[sizes[index]][0]
+        for index, arm in enumerate(arms)
+        if arm == "low"
+    }
+    high_target = high_arm_target(
+        mean_diversity, list(low_targets.values()), high_count
+    )
+
+    targets: list[float] = []
+    for index, arm in enumerate(arms):
+        if arm == "low":
+            targets.append(low_targets[index])
+        elif arm == "medium":
+            targets.append(mean_diversity)
+        else:
+            ceiling = bounds_by_size[sizes[index]][1] * HIGH_ARM_CEILING_MARGIN
+            targets.append(max(mean_diversity, min(high_target, ceiling)))
+    return targets, arms
 
 
 def estimate_diversity_bounds(
@@ -254,19 +357,31 @@ def optimize_diversity_groups(
     if distances.shape[0] != len(ids):
         raise ValueError("embedding count must match participant count")
 
-    assigned_targets = plan_diversity_targets(len(sizes), seed=seed)
     bounds_by_size = estimate_diversity_bounds(
         distances,
         sizes,
         seed=seed,
     )
-    group_bounds = [bounds_by_size[size] for size in sizes]
+    assigned_targets, diversity_levels = plan_diversity_targets(
+        sizes,
+        distances,
+        seed=seed,
+        bounds_by_size=bounds_by_size,
+    )
+    # Raw targets live on the embedding's own scale, so the annealing
+    # temperature has to scale with it rather than assuming a [0, 1] objective.
+    upper_triangle = distances[np.triu_indices(len(ids), k=1)]
+    temperature_scale = max(float(upper_triangle.var()), 1e-12)
+
     rng = random.Random(seed)
     deadline = time.monotonic() + max(0.0, time_limit_seconds)
+    # Sized so the wall-clock deadline is the binding constraint, not the
+    # iteration count. The deadline is checked inside the loop, so a generous
+    # limit costs nothing and lets an offline run spend the budget it was given.
     iteration_limit = (
         iterations_per_restart
         if iterations_per_restart is not None
-        else max(2_000, len(ids) * 40)
+        else max(20_000, len(ids) * 200)
     )
 
     best_groups: list[list[int]] | None = None
@@ -278,11 +393,7 @@ def optimize_diversity_groups(
         rng.shuffle(shuffled)
         groups = _allocate_indices(shuffled, sizes)
         scores = [_group_diversity(group, distances) for group in groups]
-        objective = _target_objective(
-            scores,
-            assigned_targets,
-            group_bounds,
-        )
+        objective = _target_objective(scores, assigned_targets)
 
         if objective > best_objective:
             best_objective = objective
@@ -292,7 +403,7 @@ def optimize_diversity_groups(
         if len(groups) == 1 or time.monotonic() >= deadline:
             break
 
-        temperature = 0.05
+        temperature = 0.05 * temperature_scale
         for iteration in range(iteration_limit):
             if time.monotonic() >= deadline:
                 break
@@ -333,13 +444,12 @@ def optimize_diversity_groups(
             previous_scores = tuple(scores[index] for index in changed_groups)
             for index in changed_groups:
                 scores[index] = _group_diversity(groups[index], distances)
-            candidate_objective = _target_objective(
-                scores,
-                assigned_targets,
-                group_bounds,
-            )
+            candidate_objective = _target_objective(scores, assigned_targets)
             delta = candidate_objective - objective
-            cooling = max(0.002, temperature * (1.0 - iteration / iteration_limit))
+            cooling = max(
+                0.002 * temperature_scale,
+                temperature * (1.0 - iteration / iteration_limit),
+            )
             accepted = delta >= 0 or rng.random() < math.exp(delta / cooling)
 
             if accepted:
@@ -369,19 +479,11 @@ def optimize_diversity_groups(
     if best_groups is None or best_scores is None:
         raise RuntimeError("text group optimization did not produce an assignment")
 
-    normalized_scores = [
-        _normalize_diversity(score, bounds)
-        for score, bounds in zip(best_scores, group_bounds)
-    ]
     return DiversityOptimizationResult(
         groups=[[ids[index] for index in group] for group in best_groups],
         achieved_diversities=best_scores,
-        normalized_achieved_diversities=normalized_scores,
         assigned_targets=assigned_targets,
-        diversity_levels=[
-            _target_level(target)
-            for target in assigned_targets
-        ],
+        diversity_levels=diversity_levels,
     )
 
 
@@ -459,63 +561,38 @@ class TextMatchingService:
                 exc,
             )
             return [
-                TextMatchGroup(
-                    participant_ids=group,
-                    diversity_level=level,
-                    diffusion_statement=FALLBACK_STATEMENT,
-                    fallback_used=True,
-                    assigned_target=assigned_target,
-                    achieved_diversity=achieved_diversity,
-                    normalized_achieved_diversity=normalized_achieved_diversity,
-                )
-                for (
-                    group,
-                    level,
-                    assigned_target,
-                    achieved_diversity,
-                    normalized_achieved_diversity,
-                ) in zip(
-                    optimization.groups,
-                    optimization.diversity_levels,
-                    optimization.assigned_targets,
-                    optimization.achieved_diversities,
-                    optimization.normalized_achieved_diversities,
-                )
+                self._build_group(optimization, index, FALLBACK_STATEMENT, True)
+                for index in range(len(optimization.groups))
             ]
 
         results = []
-        for (
-            group,
-            level,
-            assigned_target,
-            achieved_diversity,
-            normalized_achieved_diversity,
-        ) in zip(
-            optimization.groups,
-            optimization.diversity_levels,
-            optimization.assigned_targets,
-            optimization.achieved_diversities,
-            optimization.normalized_achieved_diversities,
-        ):
+        for index, group in enumerate(optimization.groups):
             group_embeddings = np.vstack(
                 [embedding_by_id[participant_id] for participant_id in group]
             )
-            results.append(
-                TextMatchGroup(
-                    participant_ids=group,
-                    diversity_level=level,
-                    diffusion_statement=select_diffusion_statement(
-                        group_embeddings,
-                        diffusion_embeddings,
-                        self.diffusion_statements,
-                    ),
-                    fallback_used=False,
-                    assigned_target=assigned_target,
-                    achieved_diversity=achieved_diversity,
-                    normalized_achieved_diversity=normalized_achieved_diversity,
-                )
+            statement = select_diffusion_statement(
+                group_embeddings,
+                diffusion_embeddings,
+                self.diffusion_statements,
             )
+            results.append(self._build_group(optimization, index, statement, False))
         return results
+
+    @staticmethod
+    def _build_group(
+        optimization: DiversityOptimizationResult,
+        index: int,
+        diffusion_statement: str,
+        fallback_used: bool,
+    ) -> TextMatchGroup:
+        return TextMatchGroup(
+            participant_ids=optimization.groups[index],
+            diversity_level=optimization.diversity_levels[index],
+            diffusion_statement=diffusion_statement,
+            fallback_used=fallback_used,
+            assigned_target=optimization.assigned_targets[index],
+            achieved_diversity=optimization.achieved_diversities[index],
+        )
 
     def _get_diffusion_embeddings(self) -> np.ndarray:
         with self._diffusion_lock:
@@ -532,21 +609,21 @@ class TextMatchingService:
         seed: int,
     ) -> list[TextMatchGroup]:
         # TODO: Design a more elegant fallback strategy than random assignment.
+        # Without embeddings there is no distance matrix, so no target can be
+        # assigned and no diversity reported -- every numeric field stays None.
         shuffled = participant_ids[:]
         random.Random(seed).shuffle(shuffled)
         groups = _allocate_indices(shuffled, group_sizes)
-        assigned_targets = plan_diversity_targets(len(groups), seed=seed)
         return [
             TextMatchGroup(
                 participant_ids=group,
                 diversity_level="unknown",
                 diffusion_statement=FALLBACK_STATEMENT,
                 fallback_used=True,
-                assigned_target=assigned_target,
+                assigned_target=None,
                 achieved_diversity=None,
-                normalized_achieved_diversity=None,
             )
-            for group, assigned_target in zip(groups, assigned_targets)
+            for group in groups
         ]
 
 
@@ -734,36 +811,10 @@ def _improve_extreme_group(
     return selected
 
 
-def _normalize_diversity(
-    score: float,
-    bounds: tuple[float, float],
-) -> float:
-    minimum, maximum = bounds
-    spread = maximum - minimum
-    if spread <= 1e-12:
-        return 0.5
-    return float(np.clip((score - minimum) / spread, 0.0, 1.0))
-
-
-def _target_level(target: float) -> DiversityLevel:
-    if target < 1 / 3:
-        return "low"
-    if target > 2 / 3:
-        return "high"
-    return "medium"
-
-
 def _target_objective(
     scores: Sequence[float],
     assigned_targets: Sequence[float],
-    group_bounds: Sequence[tuple[float, float]],
 ) -> float:
-    normalized_scores = np.asarray(
-        [
-            _normalize_diversity(score, bounds)
-            for score, bounds in zip(scores, group_bounds)
-        ],
-        dtype=np.float64,
-    )
+    achieved = np.asarray(scores, dtype=np.float64)
     targets = np.asarray(assigned_targets, dtype=np.float64)
-    return -float(np.mean(np.square(normalized_scores - targets)))
+    return -float(np.mean(np.square(achieved - targets)))

@@ -23,7 +23,6 @@ class FakeTextMatchingService:
                 fallback_used=False,
                 assigned_target=0.5,
                 achieved_diversity=0.62,
-                normalized_achieved_diversity=0.54,
             )
         ]
 
@@ -50,6 +49,7 @@ class MatchApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         for group in response.json()["results"]:
             self.assertEqual(set(group), {"groupId", "participantIds"})
+        self.assertEqual(set(response.json()), {"results"})
 
     def test_text_algorithm_returns_extended_group_fields(self):
         service = FakeTextMatchingService()
@@ -84,11 +84,35 @@ class MatchApiTests(unittest.TestCase):
                 "diversityLevel": "medium",
                 "assignedTarget": 0.5,
                 "achievedDiversity": 0.62,
-                "normalizedAchievedDiversity": 0.54,
                 "diffusionStatement": "A test statement",
                 "fallbackUsed": False,
             },
         )
+
+    def test_response_echoes_the_text_that_was_actually_embedded(self):
+        """Participants who send no text get a placeholder, so the caller cannot
+        otherwise reconstruct what the groups were built from."""
+        service = FakeTextMatchingService()
+        with patch.object(
+            main, "get_text_matching_service", return_value=service
+        ):
+            response = self.client.post(
+                "/match",
+                json={
+                    "algorithm": "textGroupMatch",
+                    "targetGroupSize": 3,
+                    "participants": {
+                        "a": {"freeTextResponse": "  supplied response  "},
+                        "b": {},
+                        "c": {},
+                    },
+                },
+            )
+
+        echoed = response.json()["participantResponses"]
+        self.assertEqual(echoed, service.participant_responses)
+        self.assertEqual(echoed["a"], "supplied response")  # trimmed, as embedded
+        self.assertTrue(echoed["b"] and echoed["c"])  # placeholders are visible
 
     def test_text_algorithm_requires_three_participants(self):
         response = self.client.post(

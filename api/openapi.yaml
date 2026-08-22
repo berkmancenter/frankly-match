@@ -75,11 +75,13 @@ paths:
 
         1. Plan group sizes, maximizing the number exactly equal to targetGroupSize while prohibiting groups smaller than 3
         2. Estimate achievable minimum and maximum average pairwise cosine distance for each planned group size
-        3. Assign normalized diversity targets: up to three levels below 40 groups and five levels at 40 or more groups
+        3. Assign three diversity targets - low, medium and high - as raw cosine distances
         4. Move groups toward their assigned targets with time-bounded multi-start neighborhood search
         5. Attach a diffusionStatement selected by maximizing its minimum distance from any member
 
-        Assigned targets are distributed approximately evenly. diversityLevel is a display label derived from assignedTarget, while achievedDiversity and normalizedAchievedDiversity report the result. If embedding fails, the API returns size-preserving random groups with fallbackUsed=true and omits achieved scores.
+        Targets are raw cosine distances rather than normalized values, so they are directly comparable across events. Group formation can only redistribute the disagreement already present in the pool, so the achieved diversities average to roughly the pool mean. Targets are set within that limit: low groups target the achievable minimum, medium groups the pool mean, and the high target is whatever the remaining budget allows, capped at the achievable maximum. Roughly a quarter of groups are low and a tenth are high. Events with fewer than three groups cannot support three levels, so every group targets the pool mean.
+
+        diversityLevel reports which arm a group was assigned to, and achievedDiversity what it reached. If embedding fails, the API returns size-preserving random groups with fallbackUsed=true and omits achieved scores.
 
         Until freeTextResponse is supplied by the upstream survey payload, missing text responses receive deterministic development placeholders.
       tags: [Matching]
@@ -100,19 +102,20 @@ paths:
                 - groupId: "1"
                   participantIds: ["uid_alice", "uid_dave", "uid_eve"]
                   diversityLevel: high
-                  assignedTarget: 1.0
-                  achievedDiversity: 0.71
-                  normalizedAchievedDiversity: 0.93
+                  assignedTarget: 1.12
+                  achievedDiversity: 1.07
                   diffusionStatement: "Political compromise is usually more valuable than ideological consistency."
                   fallbackUsed: false
                 - groupId: "2"
                   participantIds: ["uid_bob", "uid_carol", "uid_frank"]
                   diversityLevel: medium
-                  assignedTarget: 0.5
-                  achievedDiversity: 0.52
-                  normalizedAchievedDiversity: 0.48
+                  assignedTarget: 0.86
+                  achievedDiversity: 0.87
                   diffusionStatement: "Future generations should have formal representation in present-day decisions."
                   fallbackUsed: false
+              participantResponses:
+                uid_alice: "Public transit should be free in major cities."
+                uid_bob: "Transit fares help maintain reliable service."
         "400":
           $ref: "#/responses/BadRequest"
         "422":
@@ -193,6 +196,17 @@ definitions:
     type: object
     required: [results]
     properties:
+      participantResponses:
+        type: object
+        additionalProperties:
+          type: string
+        description: |
+          The text actually embedded, keyed by participantId. Returned for textGroupMatch only.
+
+          Worth persisting: a participant who supplies no freeTextResponse receives a deterministic placeholder, so this is the only record of what the groups were actually built from. Re-embedding it reproduces the distance matrix, which is what downstream analysis needs.
+        example:
+          uid_alice: "Public transit should be free in major cities."
+          uid_bob: "Transit fares help maintain reliable service."
       results:
         type: array
         description: |
@@ -224,14 +238,14 @@ definitions:
         type: string
         enum: [high, medium, low, unknown]
         description: |
-          Display label derived from assignedTarget for textGroupMatch. Targets below one-third are low, targets above two-thirds are high, and remaining targets are medium. unknown indicates random fallback after participant embedding failure.
+          Which arm this group was assigned to for textGroupMatch: low, medium or high. unknown indicates random fallback after participant embedding failure.
       assignedTarget:
         type: number
         format: double
         minimum: 0
         maximum: 1
         description: |
-          Normalized diversity target assigned to this group. Events with 3-39 groups use 0, 0.5, and 1; larger events use 0, 0.25, 0.5, 0.75, and 1. A one-group event uses 0.5 and a two-group event uses 0 and 1.
+          Raw average pairwise cosine distance targeted for this group. Low groups target the achievable minimum, medium groups the pool mean, and high groups whatever the remaining budget allows. Omitted when participant embedding fails.
       achievedDiversity:
         type: number
         format: double
@@ -239,13 +253,6 @@ definitions:
         maximum: 2
         description: |
           Raw average pairwise cosine distance achieved by the group. Omitted when participant embedding fails.
-      normalizedAchievedDiversity:
-        type: number
-        format: double
-        minimum: 0
-        maximum: 1
-        description: |
-          Achieved diversity normalized against the estimated attainable minimum and maximum for this group size. Omitted when participant embedding fails.
       diffusionStatement:
         type: string
         description: |

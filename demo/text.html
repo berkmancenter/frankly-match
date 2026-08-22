@@ -630,7 +630,6 @@
                 diagnostics.textContent = [
                     `Assigned target: ${formatScore(group.assignedTarget)}`,
                     `Raw achieved: ${formatScore(group.achievedDiversity)}`,
-                    `Normalized achieved: ${formatScore(group.normalizedAchievedDiversity)}`,
                 ].join(" · ");
 
                 card.append(header, members, diagnostics, diffusion);

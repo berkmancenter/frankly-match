@@ -6,12 +6,17 @@ import numpy as np
 from embedding_client import EmbeddingServiceError
 from text_match import (
     FALLBACK_STATEMENT,
+    HIGH_ARM_CEILING_MARGIN,
+    LOW_TO_HIGH_RATIO,
     TextMatchingService,
     cosine_distance_matrix,
     estimate_diversity_bounds,
+    high_arm_target,
     optimize_diversity_groups,
+    plan_arm_counts,
     plan_diversity_targets,
     plan_group_sizes,
+    pool_mean_distance,
     select_diffusion_statement,
 )
 
@@ -43,27 +48,114 @@ class GroupSizePlanningTests(unittest.TestCase):
             plan_group_sizes(5, 2)
 
 
+def _distances(count: int, dimensions: int = 8, seed: int = 5) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    return cosine_distance_matrix(rng.normal(size=(count, dimensions)))
+
+
+class DiversityTargetTests(unittest.TestCase):
+    def test_always_plans_three_levels(self):
+        """No silent switch to five levels at any event size."""
+        distances = _distances(60)
+        for group_count in (4, 12, 40):
+            sizes = [5] * group_count
+            _, levels = plan_diversity_targets(sizes, distances, seed=8)
+            self.assertEqual(set(levels), {"low", "medium", "high"})
+
+    def test_uses_thin_high_arm_funded_by_a_larger_low_arm(self):
+        distances = _distances(60)
+        sizes = [5] * 20
+        _, levels = plan_diversity_targets(sizes, distances, seed=8)
+
+        self.assertEqual(levels.count("low"), 5)
+        self.assertEqual(levels.count("high"), 2)
+        self.assertEqual(levels.count("medium"), 13)
+
+    def test_low_to_high_ratio_is_stable_across_event_sizes(self):
+        """The ratio sets the high target, so it must not drift with group count."""
+        for group_count in (20, 24, 40, 50, 100):
+            low, middle, high = plan_arm_counts(group_count)
+            with self.subTest(groups=group_count):
+                self.assertAlmostEqual(low / high, LOW_TO_HIGH_RATIO, delta=0.15)
+                self.assertEqual(low + middle + high, group_count)
+                self.assertGreaterEqual(middle, 1)
+
+    def test_arm_counts_reject_events_too_small_for_three_levels(self):
+        with self.assertRaisesRegex(ValueError, "at least 3 groups"):
+            plan_arm_counts(2)
+
+    def test_high_target_takes_exactly_what_the_low_arm_frees(self):
+        # Two low groups each 0.4 below the mean free 0.8 for one high group.
+        self.assertAlmostEqual(
+            high_arm_target(1.0, [0.6, 0.6], high_count=1), 1.8
+        )
+        # Same slack shared between two high groups reaches half as far.
+        self.assertAlmostEqual(
+            high_arm_target(1.0, [0.6, 0.6], high_count=2), 1.4
+        )
+
+    def test_high_target_reduces_to_the_familiar_form_at_a_zero_floor(self):
+        """H = mu * (1 + n_low / n_high) when the low arm sits at zero."""
+        for low_count, high_count in ((1, 1), (3, 1), (5, 2)):
+            with self.subTest(low=low_count, high=high_count):
+                self.assertAlmostEqual(
+                    high_arm_target(2.0, [0.0] * low_count, high_count),
+                    2.0 * (1 + low_count / high_count),
+                )
+
+    def test_targets_respect_the_budget_constraint(self):
+        """Mean of the assigned targets must not exceed the pool mean."""
+        distances = _distances(60)
+        sizes = [5] * 12
+        targets, _ = plan_diversity_targets(sizes, distances, seed=8)
+
+        self.assertLessEqual(
+            float(np.mean(targets)),
+            pool_mean_distance(distances) + 1e-9,
+        )
+
+    def test_high_target_follows_the_budget_formula(self):
+        distances = _distances(60)
+        sizes = [5] * 20
+        targets, levels = plan_diversity_targets(sizes, distances, seed=8)
+        bounds = estimate_diversity_bounds(distances, sizes, seed=8)
+        mean_diversity = pool_mean_distance(distances)
+
+        low = [t for t, level in zip(targets, levels) if level == "low"]
+        high = {t for t, level in zip(targets, levels) if level == "high"}
+        expected = (
+            len(sizes) * mean_diversity
+            - sum(low)
+            - levels.count("medium") * mean_diversity
+        ) / levels.count("high")
+
+        self.assertEqual(len(high), 1)
+        self.assertAlmostEqual(
+            high.pop(),
+            min(expected, bounds[5][1] * HIGH_ARM_CEILING_MARGIN),
+        )
+
+    def test_targets_are_raw_distances_not_normalized(self):
+        distances = _distances(60)
+        sizes = [5] * 12
+        targets, _ = plan_diversity_targets(sizes, distances, seed=8)
+
+        self.assertNotIn(0.0, targets)
+        self.assertNotIn(1.0, targets)
+        self.assertIn(pool_mean_distance(distances), targets)
+
+    def test_falls_back_to_uniform_targets_below_three_groups(self):
+        distances = _distances(20)
+        for group_count in (1, 2):
+            sizes = [5] * group_count
+            targets, levels = plan_diversity_targets(sizes, distances, seed=8)
+            self.assertEqual(levels, ["medium"] * group_count)
+            self.assertEqual(
+                targets, [pool_mean_distance(distances)] * group_count
+            )
+
+
 class DiversityOptimizationTests(unittest.TestCase):
-    def test_plans_three_or_five_adaptive_target_levels(self):
-        small_event_targets = plan_diversity_targets(39, seed=8)
-        large_event_targets = plan_diversity_targets(40, seed=8)
-
-        self.assertEqual(
-            {target: small_event_targets.count(target) for target in set(small_event_targets)},
-            {0.0: 13, 0.5: 13, 1.0: 13},
-        )
-        self.assertEqual(
-            {target: large_event_targets.count(target) for target in set(large_event_targets)},
-            {0.0: 8, 0.25: 8, 0.5: 8, 0.75: 8, 1.0: 8},
-        )
-
-    def test_assigns_extra_target_slots_from_the_center_out(self):
-        targets = plan_diversity_targets(4, seed=3)
-
-        self.assertEqual(targets.count(0.0), 1)
-        self.assertEqual(targets.count(0.5), 2)
-        self.assertEqual(targets.count(1.0), 1)
-
     def test_estimates_exact_bounds_for_small_instances(self):
         embeddings = np.random.default_rng(4).normal(size=(8, 5))
         distances = cosine_distance_matrix(embeddings)
@@ -121,38 +213,14 @@ class DiversityOptimizationTests(unittest.TestCase):
             ],
             participant_ids,
         )
-        self.assertCountEqual(result.assigned_targets, [0.0, 0.5, 0.5, 1.0])
-        self.assertEqual(result.diversity_levels.count("low"), 1)
-        self.assertEqual(result.diversity_levels.count("medium"), 2)
+        self.assertEqual(result.diversity_levels.count("low"), 2)
+        self.assertEqual(result.diversity_levels.count("medium"), 1)
         self.assertEqual(result.diversity_levels.count("high"), 1)
-        self.assertTrue(
-            all(
-                0.0 <= score <= 1.0
-                for score in result.normalized_achieved_diversities
-            )
-        )
 
         by_target = sorted(
-            zip(
-                result.assigned_targets,
-                result.normalized_achieved_diversities,
-            )
+            zip(result.assigned_targets, result.achieved_diversities)
         )
         self.assertLessEqual(by_target[0][1], by_target[-1][1])
-
-        initial_error = np.mean(
-            np.square(
-                np.asarray(initial.normalized_achieved_diversities)
-                - np.asarray(initial.assigned_targets)
-            )
-        )
-        optimized_error = np.mean(
-            np.square(
-                np.asarray(result.normalized_achieved_diversities)
-                - np.asarray(result.assigned_targets)
-            )
-        )
-        self.assertLessEqual(optimized_error, initial_error)
 
     def test_cosine_distance_normalizes_input(self):
         distances = cosine_distance_matrix(
@@ -215,18 +283,11 @@ class TextMatchingServiceTests(unittest.TestCase):
 
         self.assertEqual([len(group.participant_ids) for group in groups], [3, 3])
         self.assertTrue(all(not group.fallback_used for group in groups))
-        self.assertCountEqual(
-            [group.assigned_target for group in groups],
-            [0.0, 1.0],
-        )
+        # Two groups cannot identify three levels, so both are targeted at the
+        # pool mean rather than silently running a two-level design.
+        self.assertTrue(all(group.diversity_level == "medium" for group in groups))
         self.assertTrue(
             all(group.achieved_diversity is not None for group in groups)
-        )
-        self.assertTrue(
-            all(
-                group.normalized_achieved_diversity is not None
-                for group in groups
-            )
         )
         self.assertTrue(
             all(
@@ -253,15 +314,11 @@ class TextMatchingServiceTests(unittest.TestCase):
         self.assertTrue(
             all(group.diversity_level == "unknown" for group in groups)
         )
+        # No embeddings means no distance matrix, so nothing numeric is reported.
         self.assertTrue(
             all(group.achieved_diversity is None for group in groups)
         )
-        self.assertTrue(
-            all(
-                group.normalized_achieved_diversity is None
-                for group in groups
-            )
-        )
+        self.assertTrue(all(group.assigned_target is None for group in groups))
         self.assertTrue(
             all(
                 group.diffusion_statement == FALLBACK_STATEMENT
@@ -290,6 +347,8 @@ class TextMatchingServiceTests(unittest.TestCase):
         self.assertTrue(
             all(group.diversity_level != "unknown" for group in groups)
         )
+        # Only statement selection failed, so the optimized groups and all their
+        # diversity measurements survive.
         self.assertTrue(
             all(group.achieved_diversity is not None for group in groups)
         )

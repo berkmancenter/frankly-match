@@ -90,13 +90,16 @@ class GroupResult(BaseModel):
     diversityLevel: Optional[Literal["high", "medium", "low", "unknown"]] = None
     assignedTarget: Optional[float] = None
     achievedDiversity: Optional[float] = None
-    normalizedAchievedDiversity: Optional[float] = None
     diffusionStatement: Optional[str] = None
     fallbackUsed: Optional[bool] = None
 
 
 class MatchResponse(BaseModel):
     results: list[GroupResult]
+    # The text actually embedded, per participant. Worth returning because a
+    # participant with no freeTextResponse receives a placeholder, so the caller
+    # cannot otherwise reconstruct what the groups were built from.
+    participantResponses: Optional[dict[str, str]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -203,10 +206,10 @@ def match(req: MatchRequest):
                 diversityLevel=group.diversity_level,
                 assignedTarget=group.assigned_target,
                 achievedDiversity=group.achieved_diversity,
-                normalizedAchievedDiversity=group.normalized_achieved_diversity,
                 diffusionStatement=group.diffusion_statement,
                 fallbackUsed=group.fallback_used,
             )
             for index, group in enumerate(groups)
-        ]
+        ],
+        participantResponses=participant_responses,
     )

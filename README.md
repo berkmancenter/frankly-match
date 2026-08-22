@@ -23,7 +23,7 @@ The HTTP API selects an algorithm through the request's `algorithm` field:
 
 Text matching prioritizes group size before diversity. Every group contains at least three participants, and the size planner first maximizes the number of groups exactly equal to `targetGroupSize`. The matcher then estimates the achievable minimum and maximum average pairwise cosine distance for each group size.
 
-Events with 3–39 groups use normalized targets `0`, `0.5`, and `1`. Events with 40 or more groups use `0`, `0.25`, `0.5`, `0.75`, and `1`; one group receives `0.5`, while two groups receive `0` and `1`. A time-bounded neighborhood search moves each group toward its assigned target without changing its size. The API returns the assigned target together with raw and normalized achieved diversity.
+Each group is then assigned one of three targets — low, medium, or high — as a raw cosine distance rather than a normalized value, so targets mean the same thing across events. Group formation can only redistribute the disagreement already present in the pool, so achieved diversities average to roughly the pool mean and targets have to be set within that limit: low groups target the achievable minimum, medium groups the pool mean, and the high target is whatever the remaining budget allows, capped at the achievable maximum. Roughly a quarter of groups are low and a tenth are high. Events with fewer than three groups cannot support three levels, so every group targets the pool mean. A time-bounded neighborhood search then moves each group toward its target without changing its size.
 
 Each text-matched group also receives a reusable `diffusionStatement`. The selected statement maximizes its minimum cosine distance from any member of the group.
 
@@ -77,7 +77,9 @@ Example text request:
 }
 ```
 
-Text results add `assignedTarget`, `achievedDiversity`, `normalizedAchievedDiversity`, `diversityLevel`, `diffusionStatement`, and `fallbackUsed` to the existing `groupId` and `participantIds` fields.
+Text results add `diversityLevel`, `assignedTarget`, `achievedDiversity`, `diffusionStatement`, and `fallbackUsed` to the existing `groupId` and `participantIds` fields.
+
+Text responses also return a top-level `participantResponses` map giving the text that was actually embedded for each participant. Persist this alongside the groups: participants who supply no `freeTextResponse` receive a deterministic placeholder, so it is the only record of what the groups were built from, and re-embedding it reproduces the distance matrix that downstream analysis needs.
 
 ## Tests
 
