@@ -30,23 +30,31 @@ EXACT_BOUND_COMBINATION_LIMIT = 20_000
 # additional contrast; and a 2-group arm has no usable within-arm variance and
 # is one embedding fallback away from vanishing.
 #
-# The allocation is therefore balanced: near-equal thirds. That choice is
-# deliberately conservative rather than contrast-maximal:
-# - it is the D-optimal design for a quadratic dose-response on three support
-#   points, so an inverted-U (too much diversity harming deliberation) is
-#   detectable rather than assumed away;
-# - with unknown, possibly unequal outcome variance across arms, equal
-#   allocation is the minimax choice;
-# - every arm can lose a group to fallback and still be estimable.
-# Against the ceiling-capped contrast this costs ~15% SNR versus the
-# endpoints-only optimum, and gains ~55% over the old 5/13/2 split.
+# The allocation now follows the confirmatory test. The primary analysis is the
+# curvature contrast 2M - L - H (an interior optimum in deliberation quality,
+# per the study's theoretical motivation), with the linear contrast H - L as a
+# separately registered hypothesis. Allocating sqrt(2) : 1 : 1
+# (medium : low : high) minimises the larger marginal variance of the
+# medium-versus-extreme comparisons and lands within a few percent of the
+# variance-minimising allocation for the curvature contrast itself, while
+# keeping the extreme arms large enough for the linear contrast to stay
+# informative. At 20 groups this is 6 / 8 / 6; at 25 groups, 7 / 11 / 7.
 #
+# Keeping n_low == n_high is not cosmetic: it makes the linear and quadratic
+# contrasts exactly orthogonal (sum of c1_i * c2_i / n_i == 0), so the two
+# registered hypotheses are statistically independent and neither borrows
+# evidence from the other.
+MEDIUM_ARM_WEIGHT = 2 ** 0.5
+# Below this many groups a three-level design is not identifiable. Every group
+# is targeted at the pool mean instead, which still improves on random
+# assignment by removing scatter rather than by shifting the mean.
+MIN_GROUPS_FOR_LEVELS = 3
+
 # Targets are pulled in from the achievable extremes by TARGET_PULL_IN of the
 # range. Targeting the exact floor or ceiling means the optimizer can only miss
 # inward, which makes assignment error one-sided; a symmetric margin keeps the
 # error roughly centered and the extreme arms reliably reachable.
 TARGET_PULL_IN = 0.05
-MIN_GROUPS_FOR_LEVELS = 3
 
 DUMMY_PARTICIPANT_STATEMENTS = (
     "Public transit should be free in major cities.",
@@ -210,20 +218,20 @@ def pool_mean_distance(distances: np.ndarray) -> float:
 
 
 def plan_arm_counts(group_count: int) -> tuple[int, int, int]:
-    """Near-equal thirds: (low, middle, high), extras to low then high.
+    """Allocate groups to arms as sqrt(2) : 1 : 1 (medium : low : high).
 
-    Pure arithmetic on the group count -- no distances involved. Extras go to
-    the extreme arms: an extra low group relaxes the diversity budget, an extra
-    high group adds precision where outcome variance is most suspect.
+    Pure arithmetic on the group count -- no distances involved. The extreme
+    arms are kept equal so the linear and quadratic contrasts stay orthogonal;
+    the medium arm takes the remainder. Returns (low, middle, high).
     """
     if group_count < MIN_GROUPS_FOR_LEVELS:
         raise ValueError(
             f"three arms require at least {MIN_GROUPS_FOR_LEVELS} groups"
         )
-    base, extras = divmod(group_count, 3)
-    low_count = base + (1 if extras >= 1 else 0)
-    high_count = base + (1 if extras >= 2 else 0)
-    return low_count, group_count - low_count - high_count, high_count
+    extreme = max(1, round(group_count / (2.0 + MEDIUM_ARM_WEIGHT)))
+    while group_count - 2 * extreme < 1:
+        extreme -= 1
+    return extreme, group_count - 2 * extreme, extreme
 
 
 def high_arm_target(

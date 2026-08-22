@@ -6,6 +6,7 @@ import numpy as np
 from embedding_client import EmbeddingServiceError
 from text_match import (
     FALLBACK_STATEMENT,
+    MEDIUM_ARM_WEIGHT,
     TARGET_PULL_IN,
     TextMatchingService,
     cosine_distance_matrix,
@@ -61,27 +62,40 @@ class DiversityTargetTests(unittest.TestCase):
             _, levels = plan_diversity_targets(sizes, distances, seed=8)
             self.assertEqual(set(levels), {"low", "medium", "high"})
 
-    def test_arms_are_balanced_thirds(self):
-        """Balanced allocation: D-optimal for a quadratic dose-response, minimax
-        under unknown per-arm variance, and no arm is one fallback from empty."""
+    def test_allocates_sqrt_two_to_one_to_one(self):
+        """Medium arm is sqrt(2)x an extreme arm: minimises the larger marginal
+        variance of the medium-versus-extreme contrasts, which the confirmatory
+        curvature test depends on."""
         distances = _distances(60)
         sizes = [5] * 20
         _, levels = plan_diversity_targets(sizes, distances, seed=8)
 
-        self.assertEqual(levels.count("low"), 7)
-        self.assertEqual(levels.count("medium"), 6)
-        self.assertEqual(levels.count("high"), 7)
+        self.assertEqual(levels.count("low"), 6)
+        self.assertEqual(levels.count("medium"), 8)
+        self.assertEqual(levels.count("high"), 6)
 
-    def test_arm_counts_never_differ_by_more_than_one(self):
+    def test_reproduces_the_published_allocation_at_25_groups(self):
+        self.assertEqual(plan_arm_counts(25), (7, 11, 7))
+
+    def test_extreme_arms_stay_equal_so_contrasts_are_orthogonal(self):
+        """Linear (-1, 0, 1) and quadratic (-1, 2, -1) contrasts are orthogonal
+        iff sum(c1_i * c2_i / n_i) == 0, which holds exactly when the extreme
+        arms are equal. The two registered hypotheses must stay independent."""
         for group_count in range(3, 101):
             low, middle, high = plan_arm_counts(group_count)
             with self.subTest(groups=group_count):
+                self.assertEqual(low, high)
                 self.assertEqual(low + middle + high, group_count)
-                self.assertLessEqual(max(low, middle, high) - min(low, middle, high), 1)
-                self.assertGreaterEqual(min(low, middle, high), 1)
-                # extras go to the extreme arms, never the middle
-                self.assertGreaterEqual(low, middle)
-                self.assertGreaterEqual(high, middle)
+                self.assertGreaterEqual(middle, 1)
+                self.assertGreaterEqual(low, 1)
+                orthogonality = 1.0 / low - 1.0 / high
+                self.assertAlmostEqual(orthogonality, 0.0)
+
+    def test_medium_arm_tracks_the_sqrt_two_weight_at_scale(self):
+        for group_count in (30, 60, 100):
+            low, middle, high = plan_arm_counts(group_count)
+            with self.subTest(groups=group_count):
+                self.assertAlmostEqual(middle / low, MEDIUM_ARM_WEIGHT, delta=0.12)
 
     def test_arm_counts_reject_events_too_small_for_three_levels(self):
         with self.assertRaisesRegex(ValueError, "at least 3 groups"):
@@ -234,8 +248,9 @@ class DiversityOptimizationTests(unittest.TestCase):
             ],
             participant_ids,
         )
-        self.assertEqual(result.diversity_levels.count("low"), 2)
-        self.assertEqual(result.diversity_levels.count("medium"), 1)
+        # 4 groups -> sqrt(2):1:1 rounds to 1 low / 2 medium / 1 high
+        self.assertEqual(result.diversity_levels.count("low"), 1)
+        self.assertEqual(result.diversity_levels.count("medium"), 2)
         self.assertEqual(result.diversity_levels.count("high"), 1)
 
         by_target = sorted(

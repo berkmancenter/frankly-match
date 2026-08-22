@@ -96,9 +96,14 @@ Every `/match` call emits structured entries through `api/logger.py`:
   `condition_counts` giving the number of groups in each diversity arm.
 - the pool geometry each event's targets were derived from: pool mean, the
   achievable floor and ceiling per group size, and `r_star_by_size`, the
-  low-to-high ratio at which the achievable ceiling starts binding. On the
-  synthetic pools used to set the design this was ~0.3-0.5, which is why the
-  arms are balanced rather than skewed toward a large low arm.
+  low-to-high ratio at which the achievable ceiling starts binding.
+
+Groups are allocated to diversity arms as `sqrt(2) : 1 : 1`
+(medium : low : high) -- 6 / 8 / 6 at 20 groups, 7 / 11 / 7 at 25. This
+minimises the larger marginal variance of the medium-versus-extreme
+comparisons that the confirmatory curvature contrast `2M - L - H` depends on,
+and keeping the extreme arms equal makes the linear and quadratic contrasts
+exactly orthogonal.
 
 Size mismatches and unassigned participants raise `WARNING` and `ERROR`. A high
 arm below two groups raises a `WARNING`, since the contrast is not estimable.
