@@ -1,1 +1,4 @@
 .env
+
+# Patch files applied via git am; the commits are the record
+*.patch
