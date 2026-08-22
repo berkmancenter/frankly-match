@@ -1,4 +1,5 @@
 fastapi>=0.115
+google-cloud-logging>=3.10
 httpx>=0.27
 numpy>=1.26
 python-dotenv>=1.0

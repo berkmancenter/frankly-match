@@ -6,6 +6,7 @@ import random
 import re
 from typing import Literal, Optional
 
+from logger import log
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -117,6 +118,7 @@ _CODE_HINTS = {
 
 
 def _error(code: str, message: str, status: int) -> JSONResponse:
+    log.log_event("ERROR", f"Error {code}: {message}", request=None)
     return JSONResponse({"code": code, "message": message}, status_code=status)
 
 
@@ -164,6 +166,12 @@ def _text_responses(
             if data.freeTextResponse and data.freeTextResponse.strip()
             else placeholders[participant_id]
         )
+        log.log_event(
+            "INFO",
+            "Received participant response",
+            request=None,
+            extra_data={"participant_id": participant_id, "response_length": len(responses[participant_id])},
+        )
     return responses
 
 
@@ -182,10 +190,12 @@ def health():
     response_model=MatchResponse,
     response_model_exclude_none=True,
 )
-def match(req: MatchRequest):
+def match(req: MatchRequest, request: Request):
     if req.algorithm == "binaryGroupMatch":
         samples = _normalize_masks(req.participants)
         groups = group_match(samples, req.targetGroupSize)
+
+        log.log_event("INFO", f"Matched {len(req.participants)} participants into {len(groups)} groups via binaryGroupMatch", request=request)
         return MatchResponse(
             results=[
                 GroupResult(groupId=str(index + 1), participantIds=group)
@@ -198,6 +208,7 @@ def match(req: MatchRequest):
         participant_responses,
         req.targetGroupSize,
     )
+    log.log_event("INFO", f"Matched {len(req.participants)} participants into {len(groups)} groups via textMatchingService", request=request)
     return MatchResponse(
         results=[
             GroupResult(

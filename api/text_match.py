@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import logging
 import math
 import os
 import random
@@ -12,12 +11,10 @@ from dataclasses import dataclass
 from itertools import combinations
 from typing import Literal, Protocol
 
+from logger import log
 import numpy as np
 
 from embedding_client import EmbeddingServiceError, HuggingFaceEmbeddingClient
-
-
-logger = logging.getLogger(__name__)
 
 DiversityLevel = Literal["high", "medium", "low", "unknown"]
 FALLBACK_STATEMENT = "FALLBACK STATEMENT"
@@ -538,7 +535,7 @@ class TextMatchingService:
                 list(participant_responses.values())
             )
         except EmbeddingServiceError as exc:
-            logger.warning("Participant embedding failed; using random fallback: %s", exc)
+            log.log_event("WARNING", f"Participant embedding failed; using random fallback: {exc}", request=None)
             return self._fallback_groups(participant_ids, group_sizes, seed)
 
         optimization = optimize_diversity_groups(
@@ -556,10 +553,7 @@ class TextMatchingService:
         try:
             diffusion_embeddings = self._get_diffusion_embeddings()
         except EmbeddingServiceError as exc:
-            logger.warning(
-                "Diffusion statement embedding failed; using fallback statement: %s",
-                exc,
-            )
+            log.log_event("WARNING", f"Diffusion statement embedding failed; using fallback statement: {exc}", request=None)
             return [
                 self._build_group(optimization, index, FALLBACK_STATEMENT, True)
                 for index in range(len(optimization.groups))
