@@ -99,11 +99,14 @@ Every `/match` call emits structured entries through `api/logger.py`:
   low-to-high ratio at which the achievable ceiling starts binding.
 
 Groups are allocated to diversity arms as `sqrt(2) : 1 : 1`
-(medium : low : high) -- 6 / 8 / 6 at 20 groups, 7 / 11 / 7 at 25. This
-minimises the larger marginal variance of the medium-versus-extreme
-comparisons that the confirmatory curvature contrast `2M - L - H` depends on,
-and keeping the extreme arms equal makes the linear and quadratic contrasts
-exactly orthogonal.
+(medium : low : high) -- 6 / 8 / 6 at 20 groups, 7 / 11 / 7 at 25. This is a
+compromise, not a single optimum: the primary curvature contrast `2M - L - H`
+alone would want `2 : 1 : 1`, the pairwise `M - H` comparison wants
+`sqrt(2) : 1 : 1`, and the linear contrast `H - L` wants fatter extreme arms.
+Relative to allocating purely for the primary, this costs about 1.7 points of
+power on the curvature test and returns about 5.3 on the linear one. Keeping
+the extreme arms equal makes the linear and quadratic contrasts exactly
+orthogonal.
 
 Size mismatches and unassigned participants raise `WARNING` and `ERROR`. A high
 arm below two groups raises a `WARNING`, since the contrast is not estimable.

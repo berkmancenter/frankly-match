@@ -30,15 +30,23 @@ EXACT_BOUND_COMBINATION_LIMIT = 20_000
 # additional contrast; and a 2-group arm has no usable within-arm variance and
 # is one embedding fallback away from vanishing.
 #
-# The allocation now follows the confirmatory test. The primary analysis is the
-# curvature contrast 2M - L - H (an interior optimum in deliberation quality,
-# per the study's theoretical motivation), with the linear contrast H - L as a
-# separately registered hypothesis. Allocating sqrt(2) : 1 : 1
-# (medium : low : high) minimises the larger marginal variance of the
-# medium-versus-extreme comparisons and lands within a few percent of the
-# variance-minimising allocation for the curvature contrast itself, while
-# keeping the extreme arms large enough for the linear contrast to stay
-# informative. At 20 groups this is 6 / 8 / 6; at 25 groups, 7 / 11 / 7.
+# The allocation is a deliberate compromise across the three quantities the
+# analysis plan commits to, which have three different optimal allocations:
+#
+#   curvature contrast 2M - L - H (primary)   -> 2 : 1 : 1   (5/10/5 at G=20)
+#   pairwise M - H (needed for the strong
+#     "medium is best" claim, and for M - L)  -> sqrt(2) : 1 : 1  (6/8/6)
+#   linear contrast H - L (registered hedge)  -> fatter extremes still
+#
+# sqrt(2) : 1 : 1 sits between them. Measured cost against allocating purely
+# for the primary (5/10/5), at a true medium advantage of 1.0 group-outcome SD:
+# curvature power 67.5% vs 69.2% (-1.7 points), M - H discrimination 41.4% vs
+# 40.6%, linear contrast 37.3% vs 32.0% (+5.3 points). The 1.7-point loss on
+# the primary buys more than three times that back on the other two. Five
+# groups per extreme arm is also one dissolved group away from four, and the
+# extreme arms carry the dose contrast.
+#
+# At 20 groups this is 6 / 8 / 6; at 25 groups, 7 / 11 / 7.
 #
 # Keeping n_low == n_high is not cosmetic: it makes the linear and quadratic
 # contrasts exactly orthogonal (sum of c1_i * c2_i / n_i == 0), so the two
