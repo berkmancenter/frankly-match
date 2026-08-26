@@ -81,7 +81,11 @@ paths:
 
         Randomization happens after embedding, so a REQUIRE_REAL_TEXT failure aborts before anyone is assigned to a condition.
 
-        diversityLevel reports which arm a group was randomized into and is the regressor for analysis; achievedDiversity reports what the group reached. assignedTarget is present only for the medium arm, since minimax has no target by construction. Per-event diagnostics - pool geometry, feasible bounds per arm, achieved endpoint means, the medium target, arm-overlap gaps and per-arm restart convergence - are logged rather than returned. If embedding fails, the API returns size-preserving random groups with fallbackUsed=true and omits achieved scores.
+        The response carries only what a client renders: groupId, participantIds, diversityLevel and diffusionStatement. Every diagnostic is logged rather than returned - assignedTarget, achievedDiversity, pool geometry, feasible bounds per arm, achieved endpoint means, the medium target, arm-overlap gaps, per-arm restart convergence, and the embedded text per participant.
+
+        diversityLevel reports which arm a group was randomized into and is the regressor for analysis. If embedding fails, the API returns size-preserving random groups with diversityLevel "unknown" and the fallback diffusion statement; the failure is logged as a WARNING.
+
+        With REQUIRE_REAL_TEXT set, a participant missing freeTextResponse causes a 422 MISSING_TEXT_RESPONSES listing the affected ids, rather than silent placeholder substitution.
 
         Until freeTextResponse is supplied by the upstream survey payload, missing text responses receive deterministic development placeholders.
       tags: [Matching]
@@ -218,7 +222,7 @@ definitions:
         type: string
         enum: [high, medium, low, unknown]
         description: |
-          Which arm this group was randomized into for textGroupMatch: low, medium or high. This is the randomized assignment and is the regressor for analysis; achievedDiversity is post-randomization. unknown indicates random fallback after participant embedding failure.
+          Which arm this group was randomized into for textGroupMatch: low, medium or high. This is the randomized assignment and is the regressor for analysis. unknown indicates random fallback after participant embedding failure.
       diffusionStatement:
         type: string
         description: |
@@ -247,6 +251,7 @@ definitions:
           - INSUFFICIENT_PARTICIPANTS
           - TARGET_GROUP_SIZE_TOO_SMALL
           - UNKNOWN_ALGORITHM
+          - MISSING_TEXT_RESPONSES
           - INTERNAL_ERROR
       message:
         type: string

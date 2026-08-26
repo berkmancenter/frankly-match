@@ -570,6 +570,11 @@ def _optimise_arm(
 
     statistics = [_restart_statistic(level, b) for b in result.restart_bests]
     restart_spread = max(statistics) - min(statistics) if statistics else 0.0
+    # A single restart has a spread of zero, which would otherwise read as
+    # perfect convergence when in fact nothing was compared. That happens
+    # whenever the deadline lands inside the first restart. A one-group arm is
+    # trivially converged because its membership is fixed.
+    comparable = len(statistics) >= 2 or len(sizes) == 1
     return ArmDesign(
         level=level,
         groups=[[ids[i] for i in g] for g in result.groups],
@@ -583,7 +588,8 @@ def _optimise_arm(
         deadline_bound=result.deadline_bound,
         restart_statistics=statistics,
         restart_spread=restart_spread,
-        converged=restart_spread <= CONVERGENCE_TOLERANCE * pool_sd,
+        converged=comparable
+        and restart_spread <= CONVERGENCE_TOLERANCE * pool_sd,
     )
 
 

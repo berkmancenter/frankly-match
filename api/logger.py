@@ -5,6 +5,18 @@ from google.cloud import logging as cloud_logging
 
 
 _fallback = logging.getLogger("frankly-match")
+# This logger carries the diagnostics that are no longer in the API response, so
+# it needs its own handler at INFO. Without one it inherits the root logger's
+# WARNING level and Python's last-resort handler is WARNING-only, which would
+# silently discard every INFO record exactly when Cloud Logging is unavailable.
+if not _fallback.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    )
+    _fallback.addHandler(_handler)
+_fallback.setLevel(logging.INFO)
+_fallback.propagate = False  # our own handler emits these; do not double-log
 
 _SEVERITY_TO_LEVEL = {
     "DEBUG": logging.DEBUG,

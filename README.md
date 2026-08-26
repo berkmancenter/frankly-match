@@ -119,11 +119,21 @@ Every `/match` call emits structured entries through `api/logger.py`:
   re-embedding it reproduces the distance matrix downstream analysis needs.
 - the resulting groups with assigned target, achieved diversity, diffusion
   statement and fallback flag.
-- a group-size report comparing produced groups against `plan_group_sizes`, and
-  `condition_counts` giving the number of groups in each diversity arm.
-- the pool geometry each event's targets were derived from: pool mean, the
-  achievable floor and ceiling per group size, and `r_star_by_size`, the
-  low-to-high ratio at which the achievable ceiling starts binding.
+- a group-size report comparing produced groups against `plan_group_sizes`,
+  including `missing_participants`, `duplicated_participants` and
+  `unexpected_participants` so coverage is checked by identity rather than by
+  count, plus `condition_counts` giving the number of groups in each arm.
+- an `arms` payload, one entry per diversity arm: `level`, `groups`, `people`,
+  `sizes`, `target` (medium only), `achieved` and `achieved_mean`, the
+  achievable `floor`/`ceiling`/`margin` for that pool, and the optimizer's
+  status as `restarts_used`, `restart_statistics`, `restart_spread`,
+  `converged` and `deadline_bound`.
+- per-event geometry: `pool_mean`, the achieved `endpoint_low` and
+  `endpoint_high`, the derived `medium_target`, and `arms_separated` with the
+  `low_to_medium_gap` and `medium_to_high_gap`.
+- doses on the calibrated Bradley-Terry axis as `achieved_mean_bt`,
+  `arccos(1 - d) / pi` -- the predicted fraction of voters who would split on a
+  pair at distance `d`.
 
 Groups are allocated to diversity arms as `sqrt(2) : 1 : 1`
 (medium : low : high) -- 6 / 8 / 6 at 20 groups, 7 / 11 / 7 at 25. This is a

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections import Counter
+from collections.abc import Sequence
 from functools import lru_cache
 from pathlib import Path
 import os
@@ -238,11 +240,25 @@ def _text_responses(
 
 
 def _group_size_report(
-    participant_count: int,
+    expected_ids: Sequence[str],
     target_group_size: int,
-    group_sizes: list[int],
+    produced_groups: Sequence[Sequence[str]],
 ) -> dict:
-    """Compare the groups actually produced against the planned sizing."""
+    """Compare the groups actually produced against the planned sizing.
+
+    Coverage is checked by identity rather than by count: equal counts can hide
+    one participant duplicated and another dropped, which is exactly the failure
+    the ERROR path claims to catch.
+    """
+    participant_count = len(expected_ids)
+    group_sizes = [len(group) for group in produced_groups]
+    assigned = [pid for group in produced_groups for pid in group]
+    expected = set(expected_ids)
+    seen = Counter(assigned)
+    missing = sorted(expected - set(seen))
+    duplicated = sorted(pid for pid, n in seen.items() if n > 1)
+    unexpected = sorted(set(seen) - expected)
+
     report = {
         "participant_count": participant_count,
         "target_group_size": target_group_size,
@@ -261,9 +277,10 @@ def _group_size_report(
         report["planned_group_count"] = len(planned)
         report["planned_group_sizes"] = planned
         report["matches_plan"] = sorted(planned) == sorted(group_sizes)
-    report["all_participants_assigned"] = (
-        report["participants_assigned"] == participant_count
-    )
+    report["missing_participants"] = missing
+    report["duplicated_participants"] = duplicated
+    report["unexpected_participants"] = unexpected
+    report["all_participants_assigned"] = not (missing or duplicated or unexpected)
     return report
 
 
@@ -297,9 +314,7 @@ def match(req: MatchRequest, request: Request):
                 "participants": samples,
                 "groups": groups,
                 "group_sizes": _group_size_report(
-                    len(req.participants),
-                    req.targetGroupSize,
-                    [len(group) for group in groups],
+                    list(req.participants), req.targetGroupSize, groups
                 ),
             },
         )
@@ -318,9 +333,9 @@ def match(req: MatchRequest, request: Request):
     )
 
     size_report = _group_size_report(
-        len(req.participants),
+        list(req.participants),
         req.targetGroupSize,
-        [len(group.participant_ids) for group in groups],
+        [group.participant_ids for group in groups],
     )
     # Keyed on diversity_level rather than assigned_target: targets are raw
     # distances on the embedding's scale, so counting by target value would put

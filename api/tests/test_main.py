@@ -178,16 +178,31 @@ class MatchApiTests(unittest.TestCase):
         )
 
     def test_group_size_report_flags_a_plan_mismatch(self):
-        report = main._group_size_report(100, 5, [5] * 20)
+        ids = [f"p{index}" for index in range(100)]
+        groups = [ids[i : i + 5] for i in range(0, 100, 5)]
+
+        report = main._group_size_report(ids, 5, groups)
         self.assertEqual(report["group_count"], 20)
         self.assertEqual(report["planned_group_count"], 20)
         self.assertTrue(report["matches_plan"])
         self.assertTrue(report["all_participants_assigned"])
 
-        dropped = main._group_size_report(100, 5, [5] * 19)
+        dropped = main._group_size_report(ids, 5, groups[:19])
         self.assertFalse(dropped["matches_plan"])
         self.assertFalse(dropped["all_participants_assigned"])
         self.assertEqual(dropped["participants_assigned"], 95)
+        self.assertEqual(dropped["missing_participants"], sorted(ids[95:]))
+
+    def test_coverage_is_checked_by_identity_not_by_count(self):
+        """Equal counts can hide one participant duplicated and another dropped,
+        which is exactly the failure the ERROR path claims to catch."""
+        ids = ["a", "b", "c", "d"]
+        report = main._group_size_report(ids, 2, [["a", "b"], ["c", "c"]])
+
+        self.assertEqual(report["participants_assigned"], report["participant_count"])
+        self.assertFalse(report["all_participants_assigned"])
+        self.assertEqual(report["missing_participants"], ["d"])
+        self.assertEqual(report["duplicated_participants"], ["c"])
 
     def test_strict_mode_refuses_placeholder_substitution(self):
         """At a live event, groups built from placeholder text would look
