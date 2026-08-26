@@ -625,21 +625,10 @@
                     document.createTextNode(group.diffusionStatement || "Not returned")
                 );
 
-                const diagnostics = document.createElement("p");
-                diagnostics.className = "diagnostics";
-                diagnostics.textContent = [
-                    `Assigned target: ${formatScore(group.assignedTarget)}`,
-                    `Raw achieved: ${formatScore(group.achievedDiversity)}`,
-                    `Normalized achieved: ${formatScore(group.normalizedAchievedDiversity)}`,
-                ].join(" · ");
-
-                card.append(header, members, diagnostics, diffusion);
-                if (group.fallbackUsed) {
-                    const fallback = document.createElement("p");
-                    fallback.className = "fallback";
-                    fallback.textContent = "Fallback behavior was used for this group.";
-                    card.append(fallback);
-                }
+                // Assigned target, achieved diversity and the fallback flag are
+                // no longer in the response - they go to Cloud Logging. The demo
+                // shows the arm label, which is all the client is given.
+                card.append(header, members, diffusion);
                 resultsElement.append(card);
             });
 
@@ -649,10 +638,6 @@
         function setStatus(message, type) {
             statusElement.textContent = message;
             statusElement.className = message ? `status visible ${type}` : "status";
-        }
-
-        function formatScore(value) {
-            return Number.isFinite(value) ? Number(value).toFixed(3) : "not available";
         }
 
         renderParticipants();
