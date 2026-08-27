@@ -67,6 +67,32 @@ class ChunkPayloadTests(unittest.TestCase):
         self.assertEqual(len(chunks), 1)
         self.assertEqual(chunks[0]["responses"], ["x" * 1000])
 
+    def test_falls_back_to_unchunked_when_one_item_cannot_share_a_chunk(self):
+        # A single item too large to fit alongside anything else forces its own
+        # chunk, which can still be over max_bytes -- and unlike the two normal
+        # chunks around it, there is no smaller grouping that would fix it.
+        payload = {
+            "message": "mixed sizes",
+            "responses": ["a" * 50, "b" * 50, "c" * 1000, "d" * 50],
+        }
+        max_bytes = 300
+
+        chunks = _chunk_payload(payload, max_bytes=max_bytes)
+
+        self.assertEqual(chunks, [payload])
+
+    def test_falls_back_to_unchunked_when_base_fields_alone_exceed_the_budget(self):
+        payload = {
+            "message": "m",
+            "context": "z" * 1000,  # non-list, carried on every chunk
+            "responses": [{"text": "y" * 50} for _ in range(20)],
+        }
+        max_bytes = 300
+
+        chunks = _chunk_payload(payload, max_bytes=max_bytes)
+
+        self.assertEqual(chunks, [payload])
+
 
 class LogEventChunkingTests(unittest.TestCase):
     def test_log_event_writes_one_log_struct_call_per_chunk(self):

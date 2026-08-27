@@ -80,10 +80,18 @@ def _chunk_payload(payload, max_bytes=_MAX_ENTRY_BYTES):
     total = len(chunks)
     if total == 1:
         return [payload]
-    return [
+    result = [
         {**base, field: chunk, "chunk_index": index, "chunk_count": total}
         for index, chunk in enumerate(chunks)
     ]
+    # A single list item too large to share a chunk with anything (or non-list
+    # base fields alone near the limit) can still leave one finished chunk over
+    # max_bytes; the greedy loop above only checks a candidate once it already
+    # has company. Ship the original, unchunked payload rather than multiple
+    # pieces that quietly don't keep the promise their existence implies.
+    if any(_encoded_size(chunk) > max_bytes for chunk in result):
+        return [payload]
+    return result
 
 
 class Log:
