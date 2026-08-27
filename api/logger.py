@@ -1,4 +1,5 @@
 from functools import lru_cache
+import json
 import logging
 
 from google.cloud import logging as cloud_logging
@@ -25,6 +26,72 @@ _SEVERITY_TO_LEVEL = {
     "ERROR": logging.ERROR,
     "CRITICAL": logging.CRITICAL,
 }
+
+# Cloud Logging rejects/truncates a LogEntry over ~256 KiB. Leave headroom for
+# the entry's own metadata (severity, trace, timestamp, insertId, ...) added
+# on top of the struct payload we send.
+_MAX_ENTRY_BYTES = 240_000
+
+
+def _encoded_size(value):
+    return len(json.dumps(value, default=str).encode("utf-8"))
+
+
+def _chunk_payload(payload, max_bytes=_MAX_ENTRY_BYTES):
+    """Split ``payload`` into pieces that each encode under ``max_bytes``.
+
+    An event's extra_data can hold one unbounded list -- per-participant
+    free-text responses are the current example -- that alone can push the
+    encoded payload past what a single LogEntry can hold. Finds the
+    list-valued field responsible for the most bytes and divides only that
+    field across chunks, carrying every other field on each chunk along with
+    chunk_index/chunk_count so the pieces can be correlated and reassembled
+    later. Payloads with no list field, or already under the limit, are
+    returned unchanged as a single-item list.
+    """
+    if _encoded_size(payload) <= max_bytes:
+        return [payload]
+
+    list_fields = [key for key, value in payload.items() if isinstance(value, list)]
+    if not list_fields:
+        return [payload]
+
+    field = max(list_fields, key=lambda key: _encoded_size(payload[key]))
+    items = payload[field]
+    base = {key: value for key, value in payload.items() if key != field}
+
+    chunks = []
+    current = []
+    for item in items:
+        candidate = current + [item]
+        # Probe with placeholder chunk_index/chunk_count so the size check
+        # accounts for the metadata added to each chunk below. len(items) is a
+        # safe upper bound for chunk_count -- there can never be more chunks
+        # than items -- so the real (smaller) values never push a finished
+        # chunk over max_bytes.
+        probe = {**base, field: candidate, "chunk_index": 0, "chunk_count": len(items)}
+        if current and _encoded_size(probe) > max_bytes:
+            chunks.append(current)
+            current = [item]
+        else:
+            current = candidate
+    chunks.append(current)
+
+    total = len(chunks)
+    if total == 1:
+        return [payload]
+    result = [
+        {**base, field: chunk, "chunk_index": index, "chunk_count": total}
+        for index, chunk in enumerate(chunks)
+    ]
+    # A single list item too large to share a chunk with anything (or non-list
+    # base fields alone near the limit) can still leave one finished chunk over
+    # max_bytes; the greedy loop above only checks a candidate once it already
+    # has company. Ship the original, unchunked payload rather than multiple
+    # pieces that quietly don't keep the promise their existence implies.
+    if any(_encoded_size(chunk) > max_bytes for chunk in result):
+        return [payload]
+    return result
 
 
 class Log:
@@ -80,9 +147,10 @@ class Log:
             return
 
         try:
-            client.logger(self._logger_name).log_struct(
-                payload, severity=severity, trace=self.get_trace(request)
-            )
+            logger = client.logger(self._logger_name)
+            trace = self.get_trace(request)
+            for chunk in _chunk_payload(payload):
+                logger.log_struct(chunk, severity=severity, trace=trace)
         except Exception as exc:
             _fallback.log(level, "%s | %s", message, extra_data or {})
             _fallback.warning("Cloud Logging write failed: %s", exc)
