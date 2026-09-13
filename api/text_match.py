@@ -797,6 +797,23 @@ class TextMatchingService:
         participant_ids = list(participant_responses)
         group_sizes = plan_group_sizes(len(participant_ids), target_group_size)
         seed = _stable_seed(participant_ids)
+        log.log_event("INFO", "Matching configuration", request, extra_data={
+            "participant_order": participant_ids,
+            # String preserves all 64 bits in JSON consumers using doubles.
+            "random_seed": str(seed),
+            "seed_method": "sha256_ordered_participant_ids_first_8_bytes_big_endian",
+            "target_group_size": target_group_size,
+            "planned_group_sizes": group_sizes,
+            "optimization_seconds": self.optimization_seconds,
+            "endpoint_restarts": ENDPOINT_RESTARTS,
+            "convergence_tolerance": CONVERGENCE_TOLERANCE,
+            "medium_arm_weight": MEDIUM_ARM_WEIGHT,
+            "diversity_metric": "mean_pairwise_cosine_distance",
+            "code_revision": os.getenv("MATCH_CODE_REVISION"),
+            "embedding_model": os.getenv("HF_MODEL_ID"),
+            "embedding_model_revision": os.getenv("HF_MODEL_REVISION"),
+            "diffusion_statements": list(self.diffusion_statements),
+        })
 
         try:
             participant_embeddings = self.embedding_client.embed(
@@ -814,9 +831,28 @@ class TextMatchingService:
         # Randomisation into condition pools happens here, after embedding, so a
         # REQUIRE_REAL_TEXT failure aborts before anyone is assigned, and before
         # any distance-based decision is taken.
+        distances = cosine_distance_matrix(participant_embeddings)
+        # One row per entry avoids putting the full O(n^2) matrix in a single
+        # Cloud Logging entry. Chunk wide rows for larger events as well.
+        for row_index, participant_id in enumerate(participant_ids):
+            for start in range(0, len(participant_ids), 256):
+                log.log_event("INFO", "Participant distance row", request, extra_data={
+                    "row_index": row_index,
+                    "participant_id": participant_id,
+                    "column_start": start,
+                    "participant_count": len(participant_ids),
+                    "distances": distances[row_index, start:start + 256].tolist(),
+                })
+        log.log_event("INFO", "Participant distances complete", request, extra_data={
+            "participant_count": len(participant_ids),
+            "embedding_dimensions": int(participant_embeddings.shape[1]),
+            "distance_matrix_sha256": hashlib.sha256(
+                distances.astype("<f8").tobytes(order="C")
+            ).hexdigest(),
+        })
         design = design_event(
             participant_ids,
-            cosine_distance_matrix(participant_embeddings),
+            distances,
             target_group_size,
             seed=seed,
             time_limit_seconds=self.optimization_seconds,
@@ -1093,5 +1129,3 @@ def _improve_extreme_group(
         pair_total = best_total
 
     return selected
-
-

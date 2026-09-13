@@ -7,9 +7,11 @@ from pathlib import Path
 import os
 import random
 import re
+import time
+from uuid import uuid4
 from typing import Literal, Optional
 
-from logger import log
+from logger import log, log_context
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -34,7 +36,33 @@ app.add_middleware(
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Match-Run-ID"],
 )
+
+
+@app.middleware("http")
+async def match_run_context(request: Request, call_next):
+    if request.url.path != "/match":
+        return await call_next(request)
+    run_id = str(uuid4())
+    token = log_context.set({"match_run_id": run_id})
+    started = time.monotonic()
+    try:
+        response = await call_next(request)
+        response.headers["X-Match-Run-ID"] = run_id
+        log.log_event("INFO", "Match request completed", request, extra_data={
+            "status_code": response.status_code,
+            "duration_seconds": time.monotonic() - started,
+        })
+        return response
+    except Exception:
+        log.log_event("ERROR", "Match request failed", request, extra_data={
+            "status_code": 500,
+            "duration_seconds": time.monotonic() - started,
+        })
+        raise
+    finally:
+        log_context.reset(token)
 
 
 # ---------------------------------------------------------------------------
@@ -51,6 +79,8 @@ class MatchRequest(BaseModel):
     algorithm: str
     targetGroupSize: int
     participants: dict[str, ParticipantData]
+    studyId: Optional[str] = None
+    eventId: Optional[str] = None
 
     @field_validator("algorithm")
     @classmethod
@@ -300,6 +330,9 @@ def health():
     response_model_exclude_none=True,
 )
 def match(req: MatchRequest, request: Request):
+    log_context.set({
+        **log_context.get(), "study_id": req.studyId, "event_id": req.eventId,
+    })
     if req.algorithm == "binaryGroupMatch":
         samples = _normalize_masks(req.participants)
         groups = group_match(samples, req.targetGroupSize)
@@ -364,6 +397,10 @@ def match(req: MatchRequest, request: Request):
                     "achievedDiversity": group.achieved_diversity,
                     "diffusionStatement": group.diffusion_statement,
                     "fallbackUsed": group.fallback_used,
+                    "fallbackReason": (
+                        "participant_embedding_failed" if group.diversity_level == "unknown"
+                        else "statement_embedding_failed" if group.fallback_used else None
+                    ),
                 }
                 for index, group in enumerate(groups)
             ],

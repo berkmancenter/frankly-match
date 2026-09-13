@@ -1,4 +1,6 @@
 import unittest
+import hashlib
+from unittest.mock import patch
 from itertools import combinations
 
 import numpy as np
@@ -306,6 +308,30 @@ class EventDesignTests(unittest.TestCase):
 
 
 class TextMatchingServiceTests(unittest.TestCase):
+    def test_logged_distances_reconstruct_group_diversity(self):
+        embeddings = np.random.default_rng(7).normal(size=(100, 5))
+        service = TextMatchingService(
+            embedding_client=QueueEmbeddingClient([embeddings, np.ones((1, 5))]),
+            diffusion_statements=("statement",), optimization_seconds=0,
+        )
+        with patch("text_match.log.log_event") as logged:
+            groups = service.match({f"p{i}": f"text {i}" for i in range(100)}, 4)
+        records = [call.kwargs["extra_data"] for call in logged.call_args_list if "extra_data" in call.kwargs]
+        config = next(r for r in records if "participant_order" in r)
+        matrix = np.full((100, 100), np.nan)
+        for record in records:
+            if "row_index" in record:
+                start = record["column_start"]
+                matrix[record["row_index"], start:start + len(record["distances"])] = record["distances"]
+        np.testing.assert_array_equal(matrix, cosine_distance_matrix(embeddings))
+        checksum = next(r["distance_matrix_sha256"] for r in records if "distance_matrix_sha256" in r)
+        self.assertEqual(checksum, hashlib.sha256(matrix.astype("<f8").tobytes()).hexdigest())
+        self.assertEqual([sum(g.diversity_level == level for g in groups) for level in ("low", "medium", "high")], [7, 11, 7])
+        for group in groups:
+            self.assertEqual(len(group.participant_ids), 4)
+            indices = [config["participant_order"].index(pid) for pid in group.participant_ids]
+            self.assertAlmostEqual(group.achieved_diversity, np.mean([matrix[a, b] for a, b in combinations(indices, 2)]))
+
     def test_returns_diffusion_statement_for_each_group(self):
         participant_embeddings = np.asarray(
             [

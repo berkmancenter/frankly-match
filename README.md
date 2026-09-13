@@ -115,8 +115,7 @@ go to Google Cloud Logging instead (see Logging below).
 Every `/match` call emits structured entries through `api/logger.py`:
 
 - the embedded text per participant, flagged where a placeholder was
-  substituted. This is the only record of what the groups were built from, and
-  re-embedding it reproduces the distance matrix downstream analysis needs.
+  substituted.
 - the resulting groups with assigned target, achieved diversity, diffusion
   statement and fallback flag.
 - a group-size report comparing produced groups against `plan_group_sizes`,
@@ -151,6 +150,49 @@ arm below two groups raises a `WARNING`, since the contrast is not estimable.
 **Retention.** These logs are now the system of record for the embedded text.
 The default Cloud Logging bucket expires entries after 30 days, which is shorter
 than any study timeline — route a sink to BigQuery or GCS before relying on this.
+
+### Study linkage and reproducibility
+
+Send optional `studyId` and `eventId` strings in the `/match` request. Every
+request receives a new `match_run_id`, returned in the `X-Match-Run-ID` response
+header (also exposed to browser clients). Save that header alongside the groups
+actually used. Group IDs restart at `1`, so the group key is
+`(match_run_id, groupId)`. Retries receive distinct run IDs. Response bodies and
+matching behavior are unchanged. All logs within the matching request, including
+validation failures and embedding retries, carry the run ID and
+`log_schema_version: 1`; matching records additionally carry `study_id` and
+`event_id`. Completion records include HTTP status and elapsed seconds.
+
+`Matching configuration` records the ordered participant IDs, seed as a decimal
+string (to avoid loss of 64-bit precision), seed method, group sizes, optimization
+budget, restart count, allocation weight, metric definition, and candidate
+discussion statements. Set `MATCH_CODE_REVISION`, `HF_MODEL_ID`, and
+`HF_MODEL_REVISION` at deployment to record provenance. Missing values are null;
+the API cannot infer which model revision a hosted endpoint serves. The seed
+reproduces pool assignment, but the wall-clock optimization budget means reruns
+need not produce identical final groups.
+
+`Participant distance row` records the exact cosine-distance matrix used for
+matching. Rows follow `participant_order`; `row_index` identifies the row and
+`column_start` the first column in each chunk of at most 256 distances. Check
+that every matrix cell is present before analysis. `Participant distances
+complete` records the matrix size, embedding dimensions, and SHA-256 of its
+row-major little-endian float64 bytes, allowing reconstruction to be checked.
+This avoids needing to re-embed text using a potentially changed model.
+For 100 participants this adds 100 row entries and one completion entry.
+
+Group logs distinguish `participant_embedding_failed` from
+`statement_embedding_failed` in `fallbackReason`. Successful matching has a null
+reason. On Cloud Logging failure, the same structured payload is serialized as
+JSON in the stderr log message; logging remains best-effort and is not a durable
+archive or a transaction. A completion marker alone does not prove all writes
+succeeded. Verify the study export before relying on it.
+
+For survey analysis, join outcomes using participant ID and the matching run
+actually used, retaining randomized `diversityLevel` separately from measured
+`achievedDiversity`. Attendance, final deliberation membership, and survey
+completion must be recorded by the calling platform; this API observes only
+planned groups. Enable `REQUIRE_REAL_TEXT=1` for study deployments.
 
 ## Tests
 

@@ -1,7 +1,12 @@
 from functools import lru_cache
+from contextvars import ContextVar
+import json
 import logging
 
 from google.cloud import logging as cloud_logging
+
+
+log_context: ContextVar[dict] = ContextVar("match_log_context", default={})
 
 
 _fallback = logging.getLogger("frankly-match")
@@ -46,7 +51,7 @@ class Log:
             return cloud_logging.Client()
         except Exception as exc:
             _fallback.warning(
-                "Cloud Logging unavailable, falling back to stdout: %s", exc
+                "Cloud Logging unavailable, falling back to stderr: %s", exc
             )
             return None
 
@@ -72,11 +77,13 @@ class Log:
         payload = {"message": message}
         if extra_data:
             payload.update(extra_data)
+        payload.update(log_context.get())
+        payload["log_schema_version"] = 1
 
         level = _SEVERITY_TO_LEVEL.get(severity, logging.INFO)
         client = self._client()
         if client is None:
-            _fallback.log(level, "%s | %s", message, extra_data or {})
+            _fallback.log(level, "%s", json.dumps(payload, ensure_ascii=False))
             return
 
         try:
@@ -84,7 +91,7 @@ class Log:
                 payload, severity=severity, trace=self.get_trace(request)
             )
         except Exception as exc:
-            _fallback.log(level, "%s | %s", message, extra_data or {})
+            _fallback.log(level, "%s", json.dumps(payload, ensure_ascii=False))
             _fallback.warning("Cloud Logging write failed: %s", exc)
 
 

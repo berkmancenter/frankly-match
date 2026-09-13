@@ -29,6 +29,37 @@ class FakeTextMatchingService:
 
 
 class MatchApiTests(unittest.TestCase):
+    def test_run_ids_join_logs_to_response_and_isolate_requests(self):
+        from logger import Log
+        import json
+        service = FakeTextMatchingService()
+        with patch.object(main, "get_text_matching_service", return_value=service), patch.object(
+            Log, "_client", return_value=None
+        ), patch("logger._fallback") as fallback:
+            for event_id in ("event-a", "event-b"):
+                fallback.reset_mock()
+                response = self.client.post("/match", json={
+                    "algorithm": "textGroupMatch", "targetGroupSize": 3,
+                    "studyId": "study-1", "eventId": event_id,
+                    "participants": {"a": {}, "b": {}, "c": {}},
+                })
+                self.assertEqual(response.status_code, 200)
+                run_id = response.headers["X-Match-Run-ID"]
+                records = [json.loads(call.args[2]) for call in fallback.log.call_args_list]
+                self.assertTrue(all(r["match_run_id"] == run_id for r in records))
+                matched = next(r for r in records if "groups" in r)
+                self.assertEqual(matched["event_id"], event_id)
+                self.assertEqual(matched["study_id"], "study-1")
+                if event_id == "event-a":
+                    first_run = run_id
+                else:
+                    self.assertNotEqual(first_run, run_id)
+
+    def test_invalid_request_has_run_id(self):
+        response = self.client.post("/match", json={})
+        self.assertEqual(response.status_code, 400)
+        self.assertTrue(response.headers["X-Match-Run-ID"])
+
     def setUp(self):
         self.client = TestClient(main.app)
 
