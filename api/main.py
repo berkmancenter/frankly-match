@@ -8,6 +8,7 @@ import os
 import random
 import re
 import time
+import traceback
 from uuid import uuid4
 from typing import Literal, Optional
 
@@ -40,6 +41,19 @@ app.add_middleware(
 )
 
 
+def _adopt_request_context(request: Request) -> None:
+    """Merge study/event linkage stashed on the request into the log context.
+
+    The /match route is synchronous, so FastAPI runs it in a worker thread with
+    a *copy* of the context: a ContextVar it sets never reaches the async
+    exception handlers or this middleware's completion log. request.state is
+    backed by the ASGI scope and is shared by all of them.
+    """
+    extra = getattr(request.state, "log_context", None)
+    if extra:
+        log_context.set({**log_context.get(), **extra})
+
+
 @app.middleware("http")
 async def match_run_context(request: Request, call_next):
     if request.url.path != "/match":
@@ -48,19 +62,31 @@ async def match_run_context(request: Request, call_next):
     token = log_context.set({"match_run_id": run_id})
     started = time.monotonic()
     try:
-        response = await call_next(request)
+        try:
+            response = await call_next(request)
+        except Exception:
+            # Starlette's outer error middleware would build the 500 itself,
+            # without this header. Build it here so a failed attempt is still
+            # identifiable, and keep the traceback: once the exception no
+            # longer propagates, the server log would not print it either.
+            _adopt_request_context(request)
+            log.log_event("ERROR", "Match request failed", request, extra_data={
+                "status_code": 500,
+                "duration_seconds": time.monotonic() - started,
+                "traceback": traceback.format_exc(),
+            })
+            response = JSONResponse(
+                {"code": "INTERNAL_ERROR", "message": "Unexpected server error"},
+                status_code=500,
+            )
+        else:
+            _adopt_request_context(request)
+            log.log_event("INFO", "Match request completed", request, extra_data={
+                "status_code": response.status_code,
+                "duration_seconds": time.monotonic() - started,
+            })
         response.headers["X-Match-Run-ID"] = run_id
-        log.log_event("INFO", "Match request completed", request, extra_data={
-            "status_code": response.status_code,
-            "duration_seconds": time.monotonic() - started,
-        })
         return response
-    except Exception:
-        log.log_event("ERROR", "Match request failed", request, extra_data={
-            "status_code": 500,
-            "duration_seconds": time.monotonic() - started,
-        })
-        raise
     finally:
         log_context.reset(token)
 
@@ -166,13 +192,16 @@ _CODE_HINTS = {
 }
 
 
-def _error(code: str, message: str, status: int) -> JSONResponse:
-    log.log_event("ERROR", f"Error {code}: {message}", request=None)
+def _error(
+    code: str, message: str, status: int, request: Request | None = None
+) -> JSONResponse:
+    log.log_event("ERROR", f"Error {code}: {message}", request=request)
     return JSONResponse({"code": code, "message": message}, status_code=status)
 
 
 @app.exception_handler(MissingTextResponses)
 async def missing_text_handler(request: Request, exc: MissingTextResponses) -> JSONResponse:
+    _adopt_request_context(request)
     log.log_event(
         "ERROR",
         f"Refusing to match: {len(exc.participant_ids)} participant(s) "
@@ -203,7 +232,7 @@ async def validation_exception_handler(
         "INTERNAL_ERROR",
     )
     status = 400 if code in {"TARGET_GROUP_SIZE_TOO_SMALL", "UNKNOWN_ALGORITHM"} else 422
-    return _error(code, msg, status)
+    return _error(code, msg, status, request)
 
 
 # ---------------------------------------------------------------------------
@@ -330,9 +359,9 @@ def health():
     response_model_exclude_none=True,
 )
 def match(req: MatchRequest, request: Request):
-    log_context.set({
-        **log_context.get(), "study_id": req.studyId, "event_id": req.eventId,
-    })
+    # See _adopt_request_context: this thread's ContextVar is a private copy.
+    request.state.log_context = {"study_id": req.studyId, "event_id": req.eventId}
+    _adopt_request_context(request)
     if req.algorithm == "binaryGroupMatch":
         samples = _normalize_masks(req.participants)
         groups = group_match(samples, req.targetGroupSize)

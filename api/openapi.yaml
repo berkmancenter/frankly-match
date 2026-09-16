@@ -89,7 +89,7 @@ paths:
 
         Until freeTextResponse is supplied by the upstream survey payload, missing text responses receive deterministic development placeholders.
 
-        Optional studyId and eventId link matching logs to study records. The X-Match-Run-ID response header identifies this attempt; save it with the groups actually used. Group IDs are unique only within a run.
+        Optional studyId and eventId link matching logs to study records. The X-Match-Run-ID response header identifies this attempt and is present on every response, including 400/422 validation failures and 500 errors; save it with the groups actually used. Group IDs are unique only within a run.
       tags: [Matching]
       parameters:
         - in: body
@@ -272,14 +272,26 @@ definitions:
 responses:
   BadRequest:
     description: Malformed request body (unparseable JSON, missing required fields)
+    headers:
+      X-Match-Run-ID:
+        type: string
+        description: Unique matching attempt ID, present on every /match response so failed attempts and retries can be told apart.
     schema:
       $ref: "#/definitions/ErrorResponse"
   UnprocessableEntity:
     description: Request is well-formed but semantically invalid
+    headers:
+      X-Match-Run-ID:
+        type: string
+        description: Unique matching attempt ID, present on every /match response so failed attempts and retries can be told apart.
     schema:
       $ref: "#/definitions/ErrorResponse"
   InternalError:
     description: Unexpected server error
+    headers:
+      X-Match-Run-ID:
+        type: string
+        description: Unique matching attempt ID, present on every /match response so failed attempts and retries can be told apart.
     schema:
       $ref: "#/definitions/ErrorResponse"
 

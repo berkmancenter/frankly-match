@@ -155,7 +155,10 @@ than any study timeline — route a sink to BigQuery or GCS before relying on th
 
 Send optional `studyId` and `eventId` strings in the `/match` request. Every
 request receives a new `match_run_id`, returned in the `X-Match-Run-ID` response
-header (also exposed to browser clients). Save that header alongside the groups
+header (also exposed to browser clients) on every response, including 400/422
+validation failures and 500 errors, so failed attempts and retries can be told
+apart. Unhandled errors return `{"code": "INTERNAL_ERROR"}` with the traceback
+logged under `Match request failed`. Save that header alongside the groups
 actually used. Group IDs restart at `1`, so the group key is
 `(match_run_id, groupId)`. Retries receive distinct run IDs. Response bodies and
 matching behavior are unchanged. All logs within the matching request, including
@@ -167,25 +170,36 @@ validation failures and embedding retries, carry the run ID and
 string (to avoid loss of 64-bit precision), seed method, group sizes, optimization
 budget, restart count, allocation weight, metric definition, and candidate
 discussion statements. Set `MATCH_CODE_REVISION`, `HF_MODEL_ID`, and
-`HF_MODEL_REVISION` at deployment to record provenance. Missing values are null;
-the API cannot infer which model revision a hosted endpoint serves. The seed
+`HF_MODEL_REVISION` at deployment to record provenance: the full git commit SHA
+of the deployed code, the model repository the endpoint serves (`owner/name`),
+and that repository's commit SHA. Unset or blank values are logged as null; the
+API cannot infer which model revision a hosted endpoint serves. The seed
 reproduces pool assignment, but the wall-clock optimization budget means reruns
 need not produce identical final groups.
 
-`Participant distance row` records the exact cosine-distance matrix used for
-matching. Rows follow `participant_order`; `row_index` identifies the row and
-`column_start` the first column in each chunk of at most 256 distances. Check
-that every matrix cell is present before analysis. `Participant distances
-complete` records the matrix size, embedding dimensions, and SHA-256 of its
-row-major little-endian float64 bytes, allowing reconstruction to be checked.
-This avoids needing to re-embed text using a potentially changed model.
-For 100 participants this adds 100 row entries and one completion entry.
+`Participant distance rows` records the exact cosine-distance matrix used for
+matching. Rows follow `participant_order`. Each entry carries a block of whole
+rows starting at `row_start` (`row_count` of them, with their `participant_ids`),
+packed so that an entry stays under the Cloud Logging size limit: about 6,000
+distances per entry, so 100 participants need 2 entries and 500 need 42.
+`Participant distances complete` records the matrix size, embedding dimensions,
+`entry_count` (the number of row entries to expect), and the SHA-256 of the
+matrix's row-major little-endian float64 bytes, so a reconstruction can be
+checked without re-embedding text against a possibly changed model. Check that
+`entry_count` entries are present and the checksum matches before analysis.
+
+Each entry is a synchronous write on the request path, so events above
+`DISTANCE_LOG_MAX_PARTICIPANTS` (500) skip the row export: a `WARNING` is
+logged, `rows_logged` is false on the completion record, and only the checksum
+remains. A durable per-run export (for example one GCS object per run ID) is
+the right long-term home for this matrix and is not part of this change.
 
 Group logs distinguish `participant_embedding_failed` from
 `statement_embedding_failed` in `fallbackReason`. Successful matching has a null
 reason. On Cloud Logging failure, the same structured payload is serialized as
-JSON in the stderr log message; logging remains best-effort and is not a durable
-archive or a transaction. A completion marker alone does not prove all writes
+JSON in the stderr log message, and the failure diagnostic itself is a
+structured record carrying the same run ID and schema version. Logging remains
+best-effort and is not a durable archive or a transaction. A completion marker alone does not prove all writes
 succeeded. Verify the study export before relying on it.
 
 For survey analysis, join outcomes using participant ID and the matching run

@@ -63,6 +63,83 @@ class MatchApiTests(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(main.app)
 
+    def test_unhandled_error_returns_run_id_and_structured_500(self):
+        """Starlette's outer error middleware builds the 500 itself, without
+        our header. A failed attempt must still be identifiable, and the
+        traceback must not be lost once the exception no longer propagates."""
+        from unittest.mock import Mock
+        service = Mock()
+        service.match.side_effect = RuntimeError("optimizer exploded")
+        with patch.object(main, "get_text_matching_service", return_value=service), patch.object(
+            main.log, "log_event"
+        ) as log_event:
+            response = self.client.post("/match", json={
+                "algorithm": "textGroupMatch", "targetGroupSize": 3,
+                "participants": {"a": {}, "b": {}, "c": {}},
+            })
+        self.assertEqual(response.status_code, 500)
+        self.assertTrue(response.headers["X-Match-Run-ID"])
+        self.assertEqual(
+            response.json(), {"code": "INTERNAL_ERROR", "message": "Unexpected server error"}
+        )
+        failed = next(
+            call for call in log_event.call_args_list if call.args[1] == "Match request failed"
+        )
+        self.assertEqual(failed.args[0], "ERROR")
+        self.assertIn("optimizer exploded", failed.kwargs["extra_data"]["traceback"])
+        self.assertEqual(failed.kwargs["extra_data"]["status_code"], 500)
+
+    def test_strict_mode_refusal_keeps_study_linkage(self):
+        """The sync route sets the ContextVar in a worker thread's copy of the
+        context, which the async exception handler and the middleware's
+        completion log never see. Linkage rides on request.state instead."""
+        from logger import Log
+        import json
+        with patch.object(Log, "_client", return_value=None), patch("logger._fallback") as fallback, patch.dict(
+            main.os.environ, {"REQUIRE_REAL_TEXT": "1"}
+        ):
+            response = self.client.post("/match", json={
+                "algorithm": "textGroupMatch", "targetGroupSize": 3,
+                "studyId": "study-1", "eventId": "event-x",
+                "participants": {"a": {"freeTextResponse": "real"}, "b": {}, "c": {}},
+            })
+        self.assertEqual(response.status_code, 422)
+        run_id = response.headers["X-Match-Run-ID"]
+        records = [json.loads(call.args[2]) for call in fallback.log.call_args_list]
+        refusal = next(r for r in records if r["message"].startswith("Refusing to match"))
+        completed = next(r for r in records if r["message"] == "Match request completed")
+        for record in (refusal, completed):
+            self.assertEqual(record["match_run_id"], run_id)
+            self.assertEqual(record["study_id"], "study-1")
+            self.assertEqual(record["event_id"], "event-x")
+        self.assertEqual(completed["status_code"], 422)
+
+    def test_validation_errors_log_with_the_request(self):
+        with patch.object(main.log, "log_event") as log_event:
+            response = self.client.post("/match", json={
+                "algorithm": "nope", "targetGroupSize": 3, "participants": {"a": {}},
+            })
+        self.assertEqual(response.status_code, 400)
+        error = next(
+            call for call in log_event.call_args_list
+            if call.args[1].startswith("Error UNKNOWN_ALGORITHM")
+        )
+        self.assertIsNotNone(error.kwargs["request"])
+
+    def test_openapi_declares_run_id_header_on_every_match_response(self):
+        """The spec doubles as the API Gateway config: a header missing from
+        the error responses is invisible to generated clients exactly where
+        they need it to identify a failed attempt."""
+        import yaml
+        from pathlib import Path
+        spec = yaml.safe_load((Path(main.__file__).parent / "openapi.yaml").read_text())
+        responses = spec["paths"]["/match"]["post"]["responses"]
+        self.assertEqual(set(responses), {"200", "400", "422", "500"})
+        for status, response in responses.items():
+            if "$ref" in response:
+                response = spec["responses"][response["$ref"].rsplit("/", 1)[-1]]
+            self.assertIn("X-Match-Run-ID", response.get("headers", {}), f"{status} response")
+
     def test_binary_response_shape_remains_unchanged(self):
         response = self.client.post(
             "/match",

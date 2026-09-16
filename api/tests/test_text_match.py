@@ -1,5 +1,6 @@
 import unittest
 import hashlib
+import os
 from unittest.mock import patch
 from itertools import combinations
 
@@ -319,18 +320,63 @@ class TextMatchingServiceTests(unittest.TestCase):
         records = [call.kwargs["extra_data"] for call in logged.call_args_list if "extra_data" in call.kwargs]
         config = next(r for r in records if "participant_order" in r)
         matrix = np.full((100, 100), np.nan)
-        for record in records:
-            if "row_index" in record:
-                start = record["column_start"]
-                matrix[record["row_index"], start:start + len(record["distances"])] = record["distances"]
+        row_entries = [r for r in records if "row_start" in r]
+        for record in row_entries:
+            self.assertEqual(record["participant_ids"], config["participant_order"][record["row_start"]:record["row_start"] + record["row_count"]])
+            matrix[record["row_start"]:record["row_start"] + record["row_count"]] = record["distances"]
         np.testing.assert_array_equal(matrix, cosine_distance_matrix(embeddings))
-        checksum = next(r["distance_matrix_sha256"] for r in records if "distance_matrix_sha256" in r)
-        self.assertEqual(checksum, hashlib.sha256(matrix.astype("<f8").tobytes()).hexdigest())
+        complete = next(r for r in records if "distance_matrix_sha256" in r)
+        self.assertEqual(complete["distance_matrix_sha256"], hashlib.sha256(matrix.astype("<f8").tobytes()).hexdigest())
+        self.assertTrue(complete["rows_logged"])
+        # Rows are packed into entries, so an analyst can check completeness
+        # against entry_count instead of counting rows.
+        self.assertEqual(complete["entry_count"], len(row_entries))
+        self.assertLess(len(row_entries), 100)
         self.assertEqual([sum(g.diversity_level == level for g in groups) for level in ("low", "medium", "high")], [7, 11, 7])
         for group in groups:
             self.assertEqual(len(group.participant_ids), 4)
             indices = [config["participant_order"].index(pid) for pid in group.participant_ids]
             self.assertAlmostEqual(group.achieved_diversity, np.mean([matrix[a, b] for a, b in combinations(indices, 2)]))
+
+    def test_distance_export_is_skipped_above_the_participant_cap(self):
+        """Every row entry is a synchronous write on the request path. Above the
+        cap the export is dropped loudly: a WARNING, a completion record that
+        says so, and the checksum still present."""
+        embeddings = np.random.default_rng(3).normal(size=(12, 5))
+        service = TextMatchingService(
+            embedding_client=QueueEmbeddingClient([embeddings, np.ones((1, 5))]),
+            diffusion_statements=("statement",), optimization_seconds=0,
+        )
+        with patch("text_match.DISTANCE_LOG_MAX_PARTICIPANTS", 10), patch("text_match.log.log_event") as logged:
+            service.match({f"p{i}": f"text {i}" for i in range(12)}, 4)
+        calls = logged.call_args_list
+        records = [call.kwargs["extra_data"] for call in calls if "extra_data" in call.kwargs]
+        self.assertFalse(any("row_start" in r for r in records))
+        self.assertTrue(any(call.args[0] == "WARNING" and "export cap" in call.args[1] for call in calls))
+        complete = next(r for r in records if "distance_matrix_sha256" in r)
+        self.assertFalse(complete["rows_logged"])
+        self.assertEqual(complete["entry_count"], 0)
+        self.assertEqual(complete["max_participants"], 10)
+
+    def test_blank_provenance_is_logged_as_null(self):
+        """A copied .env.example leaves the provenance variables set but empty.
+        Those must read as missing in the study export, not as recorded."""
+        embeddings = np.random.default_rng(5).normal(size=(12, 5))
+        service = TextMatchingService(
+            embedding_client=QueueEmbeddingClient([embeddings, np.ones((1, 5))]),
+            diffusion_statements=("statement",), optimization_seconds=0,
+        )
+        env = {"MATCH_CODE_REVISION": "   ", "HF_MODEL_REVISION": " abc123 "}
+        with patch.dict(os.environ, env), patch("text_match.log.log_event") as logged:
+            os.environ.pop("HF_MODEL_ID", None)
+            service.match({f"p{i}": f"text {i}" for i in range(12)}, 4)
+        config = next(
+            call.kwargs["extra_data"] for call in logged.call_args_list
+            if "participant_order" in call.kwargs.get("extra_data", {})
+        )
+        self.assertIsNone(config["code_revision"])
+        self.assertIsNone(config["embedding_model"])
+        self.assertEqual(config["embedding_model_revision"], "abc123")
 
     def test_returns_diffusion_statement_for_each_group(self):
         participant_embeddings = np.asarray(
