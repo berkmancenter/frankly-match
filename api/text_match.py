@@ -73,6 +73,17 @@ TARGET_PULL_IN = 0.05
 CONVERGENCE_TOLERANCE = 0.10  # spread across restarts, as a share of pool distance SD
 ENDPOINT_RESTARTS = 10
 
+# Distance-matrix export. Whole rows are packed into as few Cloud Logging
+# entries as fit under the ~256 KB entry limit: a float64 serialises to about
+# 20 bytes of JSON, so 6144 values is roughly 130 KB with headroom for entry
+# metadata. Each entry is one synchronous write on the request path, so above
+# the participant cap the O(n^2) export is skipped -- loudly, with a WARNING
+# and a flag on the completion record -- rather than allowed to consume the
+# request deadline. A durable export (e.g. one GCS object per run) is the
+# long-term home for this; see the README.
+DISTANCE_LOG_VALUES_PER_ENTRY = 6144
+DISTANCE_LOG_MAX_PARTICIPANTS = 500
+
 DUMMY_PARTICIPANT_STATEMENTS = (
     "Public transit should be free in major cities.",
     "Public transit fares are necessary to maintain reliable service.",
@@ -766,6 +777,17 @@ def select_diffusion_statement(
     return list(statements)[int(np.argmax(minimum_distances))]
 
 
+def _provenance(name: str) -> str | None:
+    """Deployment provenance from the environment; blank counts as unset.
+
+    A copied .env.example leaves these set but empty. Logging "" for those
+    would make a half-configured deployment indistinguishable from a recorded
+    one in the study export, so blank normalises to null.
+    """
+    value = os.getenv(name, "").strip()
+    return value or None
+
+
 class TextMatchingService:
     def __init__(
         self,
@@ -797,6 +819,23 @@ class TextMatchingService:
         participant_ids = list(participant_responses)
         group_sizes = plan_group_sizes(len(participant_ids), target_group_size)
         seed = _stable_seed(participant_ids)
+        log.log_event("INFO", "Matching configuration", request, extra_data={
+            "participant_order": participant_ids,
+            # String preserves all 64 bits in JSON consumers using doubles.
+            "random_seed": str(seed),
+            "seed_method": "sha256_ordered_participant_ids_first_8_bytes_big_endian",
+            "target_group_size": target_group_size,
+            "planned_group_sizes": group_sizes,
+            "optimization_seconds": self.optimization_seconds,
+            "endpoint_restarts": ENDPOINT_RESTARTS,
+            "convergence_tolerance": CONVERGENCE_TOLERANCE,
+            "medium_arm_weight": MEDIUM_ARM_WEIGHT,
+            "diversity_metric": "mean_pairwise_cosine_distance",
+            "code_revision": _provenance("MATCH_CODE_REVISION"),
+            "embedding_model": _provenance("HF_MODEL_ID"),
+            "embedding_model_revision": _provenance("HF_MODEL_REVISION"),
+            "diffusion_statements": list(self.diffusion_statements),
+        })
 
         try:
             participant_embeddings = self.embedding_client.embed(
@@ -814,9 +853,45 @@ class TextMatchingService:
         # Randomisation into condition pools happens here, after embedding, so a
         # REQUIRE_REAL_TEXT failure aborts before anyone is assigned, and before
         # any distance-based decision is taken.
+        distances = cosine_distance_matrix(participant_embeddings)
+        participant_count = len(participant_ids)
+        entry_count = 0
+        rows_logged = participant_count <= DISTANCE_LOG_MAX_PARTICIPANTS
+        if rows_logged:
+            rows_per_entry = max(1, DISTANCE_LOG_VALUES_PER_ENTRY // participant_count)
+            for row_start in range(0, participant_count, rows_per_entry):
+                block = distances[row_start:row_start + rows_per_entry]
+                entry_count += 1
+                log.log_event("INFO", "Participant distance rows", request, extra_data={
+                    "row_start": row_start,
+                    "row_count": int(block.shape[0]),
+                    "participant_ids": participant_ids[row_start:row_start + rows_per_entry],
+                    "participant_count": participant_count,
+                    "distances": block.tolist(),
+                })
+        else:
+            log.log_event(
+                "WARNING",
+                "Participant distance rows not logged: event exceeds the export cap",
+                request,
+                extra_data={
+                    "participant_count": participant_count,
+                    "max_participants": DISTANCE_LOG_MAX_PARTICIPANTS,
+                },
+            )
+        log.log_event("INFO", "Participant distances complete", request, extra_data={
+            "participant_count": participant_count,
+            "embedding_dimensions": int(participant_embeddings.shape[1]),
+            "rows_logged": rows_logged,
+            "entry_count": entry_count,
+            "max_participants": DISTANCE_LOG_MAX_PARTICIPANTS,
+            "distance_matrix_sha256": hashlib.sha256(
+                distances.astype("<f8").tobytes(order="C")
+            ).hexdigest(),
+        })
         design = design_event(
             participant_ids,
-            cosine_distance_matrix(participant_embeddings),
+            distances,
             target_group_size,
             seed=seed,
             time_limit_seconds=self.optimization_seconds,
@@ -1093,5 +1168,3 @@ def _improve_extreme_group(
         pair_total = best_total
 
     return selected
-
-

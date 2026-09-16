@@ -1,7 +1,14 @@
 from functools import lru_cache
+from contextvars import ContextVar
+import json
 import logging
 
 from google.cloud import logging as cloud_logging
+
+
+log_context: ContextVar[dict] = ContextVar("match_log_context", default={})
+
+LOG_SCHEMA_VERSION = 1
 
 
 _fallback = logging.getLogger("frankly-match")
@@ -27,6 +34,21 @@ _SEVERITY_TO_LEVEL = {
 }
 
 
+def _with_context(payload: dict) -> dict:
+    """Attach the request context and schema version to a payload."""
+    return {**payload, **log_context.get(), "log_schema_version": LOG_SCHEMA_VERSION}
+
+
+def _emit_fallback(level: int, payload: dict) -> None:
+    """Write one structured record to stderr.
+
+    Every stderr record goes through here, diagnostics included, so it carries
+    the same match_run_id and schema version as the Cloud Logging payloads and
+    stays joinable to the request that produced it.
+    """
+    _fallback.log(level, "%s", json.dumps(_with_context(payload), ensure_ascii=False))
+
+
 class Log:
     """Wrapper for Google Cloud Logging client."""
     def __init__(self, logger_name="frankly-match"):
@@ -45,9 +67,14 @@ class Log:
         try:
             return cloud_logging.Client()
         except Exception as exc:
-            _fallback.warning(
-                "Cloud Logging unavailable, falling back to stdout: %s", exc
-            )
+            # The None is cached, so this fires once per process and every
+            # later log_event in the process lands on stderr as well -- not
+            # only the request whose run ID happens to be attached here.
+            _emit_fallback(logging.WARNING, {
+                "message": "Cloud Logging unavailable; this process is falling back to stderr",
+                "scope": "process",
+                "error": str(exc),
+            })
             return None
 
     def get_trace(self, request):
@@ -76,16 +103,20 @@ class Log:
         level = _SEVERITY_TO_LEVEL.get(severity, logging.INFO)
         client = self._client()
         if client is None:
-            _fallback.log(level, "%s | %s", message, extra_data or {})
+            _emit_fallback(level, payload)
             return
 
         try:
             client.logger(self._logger_name).log_struct(
-                payload, severity=severity, trace=self.get_trace(request)
+                _with_context(payload), severity=severity, trace=self.get_trace(request)
             )
         except Exception as exc:
-            _fallback.log(level, "%s | %s", message, extra_data or {})
-            _fallback.warning("Cloud Logging write failed: %s", exc)
+            _emit_fallback(level, payload)
+            _emit_fallback(logging.WARNING, {
+                "message": "Cloud Logging write failed; payload preserved on stderr",
+                "failed_message": message,
+                "error": str(exc),
+            })
 
 
 log = Log()
