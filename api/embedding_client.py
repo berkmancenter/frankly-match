@@ -13,6 +13,10 @@ DEFAULT_HF_ENDPOINT_URL = (
     "https://ttbr5oxt2cpe36qm.eu-west-1.aws.endpoints.huggingface.cloud"
 )
 
+# How long to wait between polls while the endpoint is cold-starting (HTTP 503),
+# when the response doesn't tell us how long to wait itself.
+DEFAULT_COLD_START_POLL_SECONDS = 5.0
+
 
 class EmbeddingServiceError(RuntimeError):
     pass
@@ -86,8 +90,9 @@ class HuggingFaceEmbeddingClient:
         deadline: float,
     ) -> np.ndarray:
         response: httpx.Response | None = None
+        attempt = 0
 
-        for attempt in range(self.max_retries + 1):
+        while True:
             remaining_seconds = deadline - time.monotonic()
             if remaining_seconds <= 0:
                 raise EmbeddingServiceError(
@@ -122,10 +127,34 @@ class HuggingFaceEmbeddingClient:
                         "Could not reach the embedding endpoint"
                     ) from exc
                 self._wait_before_retry(attempt, deadline)
+                attempt += 1
                 continue
 
             if response.status_code < 400:
                 break
+
+            if response.status_code == 503:
+                # A cold-started endpoint isn't a failure worth burning our
+                # limited retry budget on -- poll it until it's ready or the
+                # overall deadline runs out, whichever comes first.
+                wait_seconds = self._cold_start_wait_seconds(response, deadline)
+                if wait_seconds is None:
+                    raise EmbeddingServiceError(
+                        "Embedding endpoint did not finish starting up within "
+                        "the total timeout"
+                    )
+                log.log_event(
+                    "INFO",
+                    "Embedding endpoint is cold-starting; waiting before retrying",
+                    request=None,
+                    extra_data={
+                        "endpoint_url": self.endpoint_url,
+                        "wait_seconds": wait_seconds,
+                    },
+                )
+                time.sleep(wait_seconds)
+                continue
+
             if (
                 response.status_code != 429 and response.status_code < 500
             ) or attempt == self.max_retries:
@@ -133,6 +162,7 @@ class HuggingFaceEmbeddingClient:
                     f"Embedding endpoint returned HTTP {response.status_code}"
                 )
             self._wait_before_retry(attempt, deadline)
+            attempt += 1
 
         if response is None:
             raise EmbeddingServiceError("Embedding endpoint returned no response")
@@ -167,3 +197,36 @@ class HuggingFaceEmbeddingClient:
         delay = min(0.25 * (2**attempt), max(0.0, deadline - time.monotonic()))
         if delay > 0:
             time.sleep(delay)
+
+    @staticmethod
+    def _cold_start_wait_seconds(
+        response: httpx.Response, deadline: float
+    ) -> float | None:
+        """How long to sleep before retrying a 503 cold-start response.
+
+        Returns None if the deadline has already passed. Prefers the
+        endpoint's own estimate (Retry-After header, or the HF Inference API's
+        `estimated_time` field) over the default poll interval, but never
+        waits longer than what's left of the total timeout.
+        """
+        remaining_seconds = deadline - time.monotonic()
+        if remaining_seconds <= 0:
+            return None
+
+        wait_seconds = DEFAULT_COLD_START_POLL_SECONDS
+
+        retry_after = response.headers.get("Retry-After")
+        if retry_after is not None:
+            try:
+                wait_seconds = float(retry_after)
+            except ValueError:
+                pass
+        else:
+            try:
+                estimated_time = response.json().get("estimated_time")
+            except Exception:
+                estimated_time = None
+            if isinstance(estimated_time, (int, float)):
+                wait_seconds = float(estimated_time)
+
+        return max(0.0, min(wait_seconds, remaining_seconds))
