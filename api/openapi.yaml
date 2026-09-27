@@ -197,6 +197,16 @@ definitions:
         description: |
           Free-form survey response embedded by textGroupMatch. Whitespace-only or missing values currently receive a development placeholder.
         example: "Public transit should be free in major cities."
+      email:
+        type: string
+        description: |
+          Participant email, used by textGroupMatch to link the participant to their pre-survey entry. Optional; not format-checked. Surrounding whitespace is trimmed and a blank value is treated as absent. A participant who cannot be linked is still matched.
+        example: "alice@example.org"
+      name:
+        type: string
+        description: |
+          Participant display name, used by textGroupMatch as a fallback link to the pre-survey when the email does not match. Optional; trimmed, and blank is treated as absent.
+        example: "Alice Example"
     additionalProperties: true
 
   MatchResponse:

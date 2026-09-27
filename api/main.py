@@ -98,7 +98,17 @@ async def match_run_context(request: Request, call_next):
 class ParticipantData(BaseModel):
     binaryAnswerMask: str = ""
     freeTextResponse: Optional[str] = None
+    # Identity is used only to link a participant to their pre-survey row, and
+    # a person who cannot be linked still gets a table. So these are never
+    # validated beyond trimming: a malformed email must not 422 the whole event.
+    email: Optional[str] = None
+    name: Optional[str] = None
     model_config = {"extra": "allow"}
+
+    @field_validator("email", "name")
+    @classmethod
+    def blank_identity_is_absent(cls, v: Optional[str]) -> Optional[str]:
+        return (v.strip() or None) if v is not None else None
 
 
 class MatchRequest(BaseModel):
@@ -287,6 +297,8 @@ def _text_responses(
             "responses": [
                 {
                     "participant_id": participant_id,
+                    "email": participants[participant_id].email,
+                    "name": participants[participant_id].name,
                     "response": text,
                     "response_length": len(text),
                     "is_placeholder": participant_id in placeholder_set,

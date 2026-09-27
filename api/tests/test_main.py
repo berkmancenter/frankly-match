@@ -229,6 +229,40 @@ class MatchApiTests(unittest.TestCase):
         self.assertTrue(by_id["b"]["is_placeholder"])
         self.assertEqual(logged["placeholder_count"], 2)
 
+    def test_identity_is_trimmed_logged_and_never_rejects(self):
+        """email/name link people to the pre-survey. A missing, blank or
+        malformed value must still produce groups, never a 422."""
+        service = FakeTextMatchingService()
+        with patch.object(
+            main, "get_text_matching_service", return_value=service
+        ), patch.object(main.log, "log_event") as log_event:
+            response = self.client.post(
+                "/match",
+                json={
+                    "algorithm": "textGroupMatch",
+                    "targetGroupSize": 3,
+                    "participants": {
+                        "a": {"email": "  Alice@Example.org ", "name": " Alice "},
+                        "b": {"email": "not-an-email", "name": "   "},
+                        "c": {},
+                    },
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        logged = next(
+            call.kwargs["extra_data"]
+            for call in log_event.call_args_list
+            if "responses" in call.kwargs.get("extra_data", {})
+        )
+        by_id = {entry["participant_id"]: entry for entry in logged["responses"]}
+        # Trimmed only; case is left alone here and normalised when linking.
+        self.assertEqual(by_id["a"]["email"], "Alice@Example.org")
+        self.assertEqual(by_id["a"]["name"], "Alice")
+        self.assertEqual(by_id["b"]["email"], "not-an-email")
+        self.assertIsNone(by_id["b"]["name"])
+        self.assertIsNone(by_id["c"]["email"])
+
     def test_text_diagnostics_go_to_the_logger(self):
         service = FakeTextMatchingService()
         with patch.object(
