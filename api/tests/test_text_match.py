@@ -1,3 +1,4 @@
+import itertools
 import unittest
 import hashlib
 import os
@@ -23,8 +24,9 @@ from text_match import (
     pool_mean_distance,
     PreSurveyContext,
     maximin_scores,
-    choose_table_statements,
+    assign_statements,
     format_statements,
+    table_preferences,
 )
 from presurvey import ApprovalMatrix, Link, parse_comment_catalog
 
@@ -190,78 +192,103 @@ class DiversityTargetTests(unittest.TestCase):
 
 
 
-class TableStatementTests(unittest.TestCase):
+def _assign(context, tables):
+    """tables: list of (member_ids, member_embeddings or None)."""
+    preferences = [
+        slot for t, (members, embeddings) in enumerate(tables)
+        for slot in table_preferences(context, t, members, embeddings)
+    ]
+    return assign_statements(context, preferences)
+
+
+class TablePreferenceTests(unittest.TestCase):
     MEMBERS = ["a", "b"]
     NEAR_1_0 = np.asarray([[1.0, 0.0], [1.0, 0.0]])
 
-    def test_both_methods_run_and_pick_different_comments(self):
-        maximin, bridging = choose_table_statements(_context(), self.MEMBERS, self.NEAR_1_0)
-        # Members sit at [1, 0]: "far" is furthest from them.
-        self.assertEqual((maximin.comment_id, maximin.fallback_reason), ("far", None))
-        # a and b disagree on 3 of the 4 other comments and both approve
+    def test_both_methods_score_every_candidate(self):
+        maximin, bridging = table_preferences(_context(), 0, self.MEMBERS, self.NEAR_1_0)
+        # Members sit at [1, 0]: near, side, far are 0, 1 and 2 away.
+        np.testing.assert_allclose(maximin.scores, [0.0, 1.0, 2.0])
+        # a and b disagree on 3 of the 4 other comments and both approve only
         # "side": 2 ordered pairs * 3 / (n^2 = 4 * m = 5).
-        self.assertEqual((bridging.comment_id, bridging.fallback_reason), ("side", None))
-        self.assertAlmostEqual(bridging.score, 0.3)
-        self.assertEqual(bridging.population_size, 2)
-        self.assertEqual(bridging.observed_share, 1.0)
-
-    def test_bridging_takes_its_runner_up_when_maximin_has_its_pick(self):
-        # Members at [0, -1] put "side" furthest away, so maximin takes it.
-        maximin, bridging = choose_table_statements(
-            _context(), self.MEMBERS, np.asarray([[0.0, -1.0]] * 2)
-        )
-        self.assertEqual(maximin.comment_id, "side")
-        self.assertEqual(bridging.comment_id, "near")
+        np.testing.assert_allclose(bridging.scores, [0.0, 0.3, 0.0])
+        self.assertEqual((bridging.population_size, bridging.observed_share), (2, 1.0))
         self.assertIsNone(bridging.fallback_reason)
 
-    def test_own_comments_are_skipped(self):
+    def test_own_comments_are_not_allowed(self):
         links = {**LINKED_AB, "c": Link("c", "email", 2, "pid_far")}
-        maximin, _ = choose_table_statements(
-            _context(links), ["a", "b", "c"], np.asarray([[1.0, 0.0]] * 3)
-        )
-        # "far" would win, but c wrote it.
-        self.assertEqual(maximin.comment_id, "side")
+        maximin, _ = table_preferences(_context(links), 0, ["a", "b", "c"], np.asarray([[1.0, 0.0]] * 3))
+        np.testing.assert_array_equal(maximin.allowed, [True, True, False])
 
-    def test_text_has_whitespace_collapsed(self):
-        maximin, _ = choose_table_statements(
-            _context(), self.MEMBERS, np.asarray([[0.0, -1.0]] * 2)
-        )
-        self.assertEqual(maximin.text, "side comment")
-
-    def test_bridging_falls_back_to_the_global_ranking(self):
-        for context, members, reason in (
-            (_context(matrix=None), self.MEMBERS, "matrix_unavailable"),
-            (_context(links={"a": LINKED_AB["a"]}), self.MEMBERS, "fewer_than_two_linked"),
+    def test_methods_that_cannot_run_rank_by_the_global_order(self):
+        for context, members, embeddings, method, reason in (
+            (_context(matrix=None), self.MEMBERS, self.NEAR_1_0, 1, "matrix_unavailable"),
+            (_context(links={"a": LINKED_AB["a"]}), self.MEMBERS, self.NEAR_1_0, 1, "fewer_than_two_linked"),
             # Two registrants on one pre-survey row are one voter.
             (_context(links={"a": LINKED_AB["a"], "b": Link("b", "name", 0, "v_a")}),
-             self.MEMBERS, "fewer_than_two_linked"),
+             self.MEMBERS, self.NEAR_1_0, 1, "fewer_than_two_linked"),
+            (_context(), self.MEMBERS, None, 0, "participant_embedding_failed"),
+            (_context(), self.MEMBERS, np.ones((2, 3)), 0, "pick_failed"),
         ):
             with self.subTest(reason=reason):
-                maximin, bridging = choose_table_statements(context, members, self.NEAR_1_0)
-                self.assertEqual(bridging.fallback_reason, reason)
-                # Top of the global ranking, which maximin ("far") does not hold.
-                self.assertEqual(bridging.comment_id, "side")
-                self.assertIsNone(bridging.score)
+                slot = table_preferences(context, 0, members, embeddings)[method]
+                self.assertTrue(slot.fallback_reason.startswith(reason))
+                # fallback_rows is (side, near, far).
+                np.testing.assert_array_equal(slot.ranks(), [1, 0, 2])
 
-    def test_the_fallback_never_duplicates_the_other_slot(self):
-        maximin, bridging = choose_table_statements(
-            _context(matrix=None), self.MEMBERS, np.asarray([[0.0, -1.0]] * 2)
-        )
-        self.assertEqual(maximin.comment_id, "side")
-        self.assertEqual(bridging.comment_id, "near")
 
-    def test_maximin_falls_back_without_embeddings_while_bridging_still_runs(self):
-        maximin, bridging = choose_table_statements(_context(), self.MEMBERS, None)
-        self.assertEqual(bridging.comment_id, "side")
-        self.assertEqual(maximin.fallback_reason, "participant_embedding_failed")
-        self.assertEqual(maximin.comment_id, "near")
+SIX_CANDIDATES = PreSurveyContext(
+    catalog=_catalog([
+        (f"c{i}", "stocking_growing", f"author{i}", f"text {i}", [np.cos(i), np.sin(i)])
+        for i in range(6)
+    ]),
+    matrix=None, links={}, candidate_rows=tuple(range(6)), fallback_rows=(3, 1, 4, 0, 5, 2),
+)
 
-    def test_no_catalog_means_the_fallback_text(self):
-        maximin, bridging = choose_table_statements(
-            _context(catalog=None), self.MEMBERS, self.NEAR_1_0
-        )
-        self.assertEqual(maximin.text, FALLBACK_STATEMENT)
-        self.assertEqual(bridging.fallback_reason, "catalog_unavailable")
+
+class AssignmentTests(unittest.TestCase):
+    def test_a_lone_table_gets_each_methods_top_choice(self):
+        result = _assign(_context(), [(["a", "b"], np.asarray([[1.0, 0.0]] * 2))])
+        maximin, bridging = result.choices
+        self.assertEqual((maximin.comment_id, maximin.rank), ("far", 0))
+        self.assertEqual((bridging.comment_id, bridging.rank), ("side", 0))
+        self.assertAlmostEqual(bridging.score, 0.3)
+        self.assertEqual(result.total_rank, 0)
+
+    def test_tables_never_share_a_comment_while_candidates_last(self):
+        # Two identical tables want the same comments; with 6 candidates for
+        # 4 slots, each comment is used once and the second table gives way.
+        context = SIX_CANDIDATES
+        same = np.asarray([[1.0, 0.2]])
+        result = _assign(context, [(["x"], same), (["y"], same)])
+        self.assertEqual(result.max_uses_per_comment, 1)
+        self.assertEqual(len({choice.comment_id for choice in result.choices}), 4)
+
+    def test_comments_are_reused_only_once_candidates_run_out(self):
+        # 4 slots over 3 candidates: each comment may appear twice.
+        near = np.asarray([[1.0, 0.0]] * 2)
+        result = _assign(_context(matrix=None), [(["a", "b"], near), (["a", "b"], near)])
+        self.assertEqual(result.max_uses_per_comment, 2)
+        ids = [choice.comment_id for choice in result.choices]
+        # Every candidate is used before any is used twice: one reuse only.
+        self.assertEqual(sorted(ids.count(c) for c in set(ids)), [1, 1, 2])
+
+    def test_a_table_never_shows_the_same_comment_twice(self):
+        near = np.asarray([[1.0, 0.0]] * 2)
+        result = _assign(_context(matrix=None), [(["a", "b"], near)] * 3)
+        for t in range(3):
+            self.assertNotEqual(result.choices[2 * t].comment_id, result.choices[2 * t + 1].comment_id)
+
+    def test_the_assignment_minimises_total_rank(self):
+        """Brute force over every way to give 2 tables' 4 slots distinct
+        comments from 6 candidates."""
+        context = SIX_CANDIDATES
+        tables = [(["x"], np.asarray([[1.0, 0.2]])), (["y"], np.asarray([[-0.3, 1.0]]))]
+        preferences = [s for t, (m, e) in enumerate(tables) for s in table_preferences(context, t, m, e)]
+        ranks = np.vstack([p.ranks() for p in preferences])
+        best = min(sum(ranks[k, c] for k, c in enumerate(cols))
+                   for cols in itertools.permutations(range(6), 4))
+        self.assertEqual(assign_statements(context, preferences).total_rank, best)
 
     def test_format(self):
         self.assertEqual(format_statements("x", "y"), "Statement A: x\n\nStatement B: y")
@@ -528,10 +555,18 @@ class TextMatchingServiceTests(unittest.TestCase):
             if call.args[1] == "Diffusion picks"
         )
         self.assertEqual(record["candidate_count"], 3)
+        # 4 tables x 2 slots over 3 candidates: each comment is used at most
+        # 3 times, and "far" (everyone's maximin favourite) goes to one table.
+        self.assertEqual(record["max_uses_per_comment"], 3)
+        maximin_ids = [g["maximin"]["comment_id"] for g in record["groups"]]
+        self.assertLessEqual(max(maximin_ids.count(c) for c in set(maximin_ids)), 3)
         for group, logged_group in zip(groups, record["groups"]):
             # No matrix is configured: maximin runs, bridging falls back.
-            self.assertEqual(logged_group["maximin"]["comment_id"], "far")
+            self.assertIsNone(logged_group["maximin"]["fallback_reason"])
             self.assertEqual(logged_group["bridging"]["fallback_reason"], "matrix_unavailable")
+            self.assertNotEqual(
+                logged_group["maximin"]["comment_id"], logged_group["bridging"]["comment_id"]
+            )
             first = logged_group[logged_group["slot_a_method"]]["text"]
             second_method = "bridging" if logged_group["slot_a_method"] == "maximin" else "maximin"
             self.assertEqual(

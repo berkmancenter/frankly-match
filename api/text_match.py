@@ -13,6 +13,7 @@ from typing import Literal, Protocol
 from logger import log
 import numpy as np
 
+from assignment import min_cost_assignment
 from bridging import pairwise_disagreement_scores
 from embedding_client import EmbeddingServiceError, HuggingFaceEmbeddingClient
 from presurvey import (
@@ -789,16 +790,43 @@ def maximin_scores(
 
 
 @dataclass(frozen=True)
+class SlotPreferences:
+    """How one statement slot ranks the candidates, before the event-wide
+    assignment. scores and allowed are aligned with context.candidate_rows.
+    A slot whose method cannot run ranks by the global bridging order."""
+
+    table: int
+    method: Literal["maximin", "bridging"]
+    scores: np.ndarray
+    allowed: np.ndarray
+    fallback_reason: str | None = None
+    population_size: int | None = None
+    observed_share: float | None = None
+
+    def ranks(self) -> np.ndarray:
+        """0 for this slot's top choice among allowed candidates, and so on."""
+        order = np.argsort(-np.where(self.allowed, self.scores, -np.inf), kind="stable")
+        ranks = np.empty(len(order))
+        ranks[order] = np.arange(len(order))
+        return ranks
+
+
+@dataclass(frozen=True)
 class DiffusionChoice:
-    """One of a table's two statements. fallback_reason is set when the
-    method could not run and the comment came from the global ranking."""
+    """One of a table's two statements, as assigned for the whole event.
+
+    rank is where the assigned comment sat in this slot's own preferences
+    (0 = its top choice); top_choice_* is what it would have picked alone.
+    score is the method's score for the assigned comment, or None when the
+    slot fell back to the global bridging order."""
 
     method: Literal["maximin", "bridging"]
     comment_id: str | None
     text: str
     score: float | None = None
-    runner_up_id: str | None = None
-    runner_up_score: float | None = None
+    rank: int | None = None
+    top_choice_id: str | None = None
+    top_choice_score: float | None = None
     fallback_reason: str | None = None
     population_size: int | None = None
     observed_share: float | None = None
@@ -813,106 +841,149 @@ def format_statements(first: str, second: str) -> str:
     return f"Statement A: {first}\n\nStatement B: {second}"
 
 
-def _ranked(rows: Sequence[int], scores: np.ndarray, exclude_id: str | None, catalog):
-    """(row, score) best first, skipping the comment the other slot holds."""
-    order = np.argsort(-np.asarray(scores), kind="stable")
-    return [
-        (rows[k], float(scores[k])) for k in order
-        if catalog.comments[rows[k]].comment_id != exclude_id
-    ]
-
-
-def _choice(method, ranked, catalog, **extra) -> DiffusionChoice:
-    best, score = ranked[0]
-    runner_up = ranked[1] if len(ranked) > 1 else None
-    return DiffusionChoice(
-        method=method,
-        comment_id=catalog.comments[best].comment_id,
-        text=_clean(catalog.comments[best].text),
-        score=score,
-        runner_up_id=catalog.comments[runner_up[0]].comment_id if runner_up else None,
-        runner_up_score=runner_up[1] if runner_up else None,
-        **extra,
-    )
-
-
-def choose_table_statements(
+def table_preferences(
     context: PreSurveyContext,
+    table: int,
     member_ids: Sequence[str],
     member_embeddings: np.ndarray | None,
-) -> tuple[DiffusionChoice, DiffusionChoice]:
-    """The table's maximin and bridging comments, never the same one.
+) -> tuple[SlotPreferences, SlotPreferences]:
+    """The table's maximin and bridging preferences over the candidates.
 
-    Candidates are the eligible diffusion-topic comments not written by any
-    member linked to the pre-survey. A method that cannot run takes the best
-    comment from the global bridging ranking that is not the table's own and
-    not already in the other slot.
+    A table's own comments (by members linked to the pre-survey) are not
+    allowed. A method that cannot run falls back to the global bridging order.
     """
     catalog = context.catalog
-    if catalog is None:
-        return tuple(
-            DiffusionChoice(method, None, FALLBACK_STATEMENT, fallback_reason="catalog_unavailable")
-            for method in ("maximin", "bridging")
-        )
-
+    candidates = context.candidate_rows
     linked = [
         context.links[pid] for pid in member_ids
         if pid in context.links and context.links[pid].row is not None
     ]
     authors = {link.presurvey_pid for link in linked}
-    rows = [
-        row for row in context.candidate_rows
-        if catalog.comments[row].author_pid not in authors
-    ]
+    allowed = np.array(
+        [catalog.comments[row].author_pid not in authors for row in candidates], dtype=bool
+    )
+    position = {row: k for k, row in enumerate(context.fallback_rows)}
+    global_order = -np.array(
+        [position.get(row, len(position)) for row in candidates], dtype=np.float64
+    )
 
-    maximin: DiffusionChoice | str
+    def fallback(method, reason):
+        return SlotPreferences(table, method, global_order, allowed, fallback_reason=reason)
+
     if member_embeddings is None:
-        maximin = "participant_embedding_failed"
-    elif not rows:
-        maximin = "no_candidates_left"
+        maximin = fallback("maximin", "participant_embedding_failed")
     else:
         try:
-            scores = maximin_scores(member_embeddings, catalog.embeddings[rows])
-            maximin = _choice("maximin", _ranked(rows, scores, None, catalog), catalog)
+            maximin = SlotPreferences(
+                table, "maximin",
+                maximin_scores(member_embeddings, catalog.embeddings[list(candidates)]),
+                allowed,
+            )
         except ValueError as exc:
-            maximin = f"pick_failed: {exc}"
+            maximin = fallback("maximin", f"pick_failed: {exc}")
 
     # Duplicate-row links (e.g. a shared email) count once in the population.
     population = sorted({link.row for link in linked})
-    bridging: DiffusionChoice | str
     if context.matrix is None:
-        bridging = "matrix_unavailable"
+        bridging = fallback("bridging", "matrix_unavailable")
     elif len(population) < 2:
-        bridging = "fewer_than_two_linked"
+        bridging = fallback("bridging", "fewer_than_two_linked")
     else:
-        taken = maximin.comment_id if isinstance(maximin, DiffusionChoice) else None
         probabilities = context.matrix.probabilities[population]
-        ranked = _ranked(
-            rows, pairwise_disagreement_scores(probabilities, rows), taken, catalog
-        ) if rows else []
-        bridging = _choice(
-            "bridging", ranked, catalog,
+        bridging = SlotPreferences(
+            table, "bridging",
+            pairwise_disagreement_scores(probabilities, list(candidates)),
+            allowed,
             population_size=len(population),
             observed_share=float(np.mean((probabilities == 0) | (probabilities == 1))),
-        ) if ranked else "no_candidates_left"
-
-    def fallback(method: str, reason: str, other: DiffusionChoice | str) -> DiffusionChoice:
-        taken = other.comment_id if isinstance(other, DiffusionChoice) else None
-        for row in context.fallback_rows:
-            comment = catalog.comments[row]
-            if comment.author_pid not in authors and comment.comment_id != taken:
-                return DiffusionChoice(
-                    method, comment.comment_id, _clean(comment.text), fallback_reason=reason
-                )
-        return DiffusionChoice(
-            method, None, FALLBACK_STATEMENT, fallback_reason=f"{reason}; ranking_exhausted"
         )
-
-    if isinstance(maximin, str):
-        maximin = fallback("maximin", maximin, bridging)
-    if isinstance(bridging, str):
-        bridging = fallback("bridging", bridging, maximin)
     return maximin, bridging
+
+
+@dataclass(frozen=True)
+class EventAssignment:
+    choices: list[DiffusionChoice]
+    max_uses_per_comment: int
+    total_rank: int
+    collision_rounds: int
+
+
+def assign_statements(
+    context: PreSurveyContext, preferences: Sequence[SlotPreferences]
+) -> EventAssignment:
+    """Give every slot a comment, jointly for the whole event.
+
+    Each comment is used at most ceil(slots / candidates) times, so no two
+    tables share a statement until there are more slots than candidates, and
+    then as few comments as possible are reused: every reuse costs more than
+    any saving in rank could repay. Within that, the total rank lost across
+    slots is minimised, which weighs maximin and bridging equally despite
+    their different score scales.
+
+    A table must not show the same comment twice, which the assignment itself
+    cannot express once comments are reused. So after solving, a table that
+    got one comment in both slots has it forbidden for whichever slot ranks it
+    lower, and the event is solved again. Each round only adds constraints,
+    and collisions are rare, so this ends quickly.
+    """
+    catalog = context.catalog
+    candidates = context.candidate_rows
+    count = len(candidates)
+    uses = max(1, math.ceil(len(preferences) / count))
+    ranks = np.vstack([slot.ranks() for slot in preferences])
+    forbidden = ~np.vstack([slot.allowed for slot in preferences])
+
+    # Costs are lexicographic: a forbidden pairing (a table's own comment, or
+    # one a collision round ruled out) outweighs any number of reuses, and a
+    # reuse outweighs any total rank.
+    reuse_cost = len(preferences) * count + 1.0
+    forbidden_cost = len(preferences) * (count + uses * reuse_cost) + 1.0
+
+    rounds = 0
+    while True:
+        rounds += 1
+        cost = np.where(forbidden, forbidden_cost, ranks)
+        picked = min_cost_assignment(
+            np.hstack([cost + copy * reuse_cost for copy in range(uses)])
+        ) % count
+        by_table: dict[int, list[int]] = {}
+        for index, slot in enumerate(preferences):
+            by_table.setdefault(slot.table, []).append(index)
+        collisions = [
+            slots for slots in by_table.values()
+            if len(slots) == 2 and picked[slots[0]] == picked[slots[1]]
+        ]
+        if not collisions:
+            break
+        for first, second in collisions:
+            column = picked[first]
+            worse = first if ranks[first, column] > ranks[second, column] else second
+            forbidden[worse, column] = True
+
+    choices = []
+    for index, slot in enumerate(preferences):
+        column = int(picked[index])
+        top = int(np.argmin(np.where(slot.allowed, ranks[index], np.inf)))
+        comment = catalog.comments[candidates[column]]
+        computed = slot.fallback_reason is None
+        choices.append(DiffusionChoice(
+            method=slot.method,
+            comment_id=comment.comment_id,
+            text=_clean(comment.text),
+            score=float(slot.scores[column]) if computed else None,
+            rank=int(ranks[index, column]),
+            top_choice_id=catalog.comments[candidates[top]].comment_id,
+            top_choice_score=float(slot.scores[top]) if computed else None,
+            fallback_reason=slot.fallback_reason,
+            population_size=slot.population_size,
+            observed_share=slot.observed_share,
+        ))
+    return EventAssignment(
+        choices=choices,
+        max_uses_per_comment=uses,
+        total_rank=int(sum(choice.rank for choice in choices)),
+        collision_rounds=rounds - 1,
+    )
 
 
 def _provenance(name: str) -> str | None:
@@ -1070,18 +1141,36 @@ class TextMatchingService:
         request=None,
     ) -> list[tuple[str, bool]]:
         """Each group's "Statement A / Statement B" text and whether either
-        slot fell back. Which method fills slot A is randomised per group."""
+        slot fell back. Statements are assigned jointly across the event so
+        tables do not share them; which method fills slot A is randomised
+        per group."""
         context = self._load_presurvey(identities, request)
-        order_rng = random.Random(seed ^ 0xAB0DE)
-        results = []
-        records = []
-        for group, level in zip(groups, levels):
-            maximin, bridging = choose_table_statements(
+        if context.catalog is None or not context.candidate_rows:
+            reason = "catalog_unavailable" if context.catalog is None else "no_candidates"
+            log.log_event(
+                "ERROR", f"No diffusion candidates ({reason}); using the fallback text", request,
+            )
+            text = format_statements(FALLBACK_STATEMENT, FALLBACK_STATEMENT)
+            return [(text, True) for _ in groups]
+
+        preferences = [
+            slot
+            for table, group in enumerate(groups)
+            for slot in table_preferences(
                 context,
+                table,
                 group,
                 None if embedding_by_id is None
                 else np.vstack([embedding_by_id[pid] for pid in group]),
             )
+        ]
+        assignment = assign_statements(context, preferences)
+
+        order_rng = random.Random(seed ^ 0xAB0DE)
+        results = []
+        records = []
+        for table, (group, level) in enumerate(zip(groups, levels)):
+            maximin, bridging = assignment.choices[2 * table], assignment.choices[2 * table + 1]
             maximin_first = order_rng.random() < 0.5
             first, second = (maximin, bridging) if maximin_first else (bridging, maximin)
             fell_back = bool(maximin.fallback_reason or bridging.fallback_reason)
@@ -1096,6 +1185,10 @@ class TextMatchingService:
 
         log.log_event("INFO", "Diffusion picks", request, extra_data={
             "candidate_count": len(context.candidate_rows),
+            "slot_count": len(preferences),
+            "max_uses_per_comment": assignment.max_uses_per_comment,
+            "total_rank": assignment.total_rank,
+            "collision_rounds": assignment.collision_rounds,
             "maximin_fallback_count": sum(1 for r in records if r["maximin"]["fallback_reason"]),
             "bridging_fallback_count": sum(1 for r in records if r["bridging"]["fallback_reason"]),
             "groups": records,

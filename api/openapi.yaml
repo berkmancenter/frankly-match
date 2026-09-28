@@ -248,7 +248,7 @@ definitions:
       diffusionStatement:
         type: string
         description: |
-          Two pre-survey comments on the diffusion topic, formatted as "Statement A: <comment>\n\nStatement B: <comment>". One is the comment furthest (by cosine distance) from the group's nearest member; the other is the comment the group's linked pre-survey voters find most bridging. Which fills slot A is randomized per group. A statement that cannot be computed is taken from a precomputed global bridging ranking.
+          Two pre-survey comments on the diffusion topic, formatted as "Statement A: <comment>\n\nStatement B: <comment>". One is chosen for distance (by cosine distance) from the group's nearest member, the other for how bridging the group's linked pre-survey voters find it. Comments are assigned across all groups jointly, so groups do not share a statement until there are more statements than candidates. Which fills slot A is randomized per group. A ranking that cannot be computed uses a precomputed global bridging ranking.
     additionalProperties: true
 
   HealthResponse:

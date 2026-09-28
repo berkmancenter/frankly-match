@@ -54,10 +54,12 @@ sits at its pool's real limit rather than being stuck.
 
 Each text-matched group also receives a `diffusionStatement`: a comment from the pre-survey on the diffusion topic (`stocking_growing`), chosen from those an offline LLM screen marked eligible in `api/data/diffusion_eligibility.json` (see `api/scripts/judge_diffusion_comments.py`). Comments written by anyone at the table who links to the pre-survey are skipped. The statement has two parts, returned as `Statement A: …` and `Statement B: …` separated by a blank line, with the order randomized per table:
 
-- **Maximin:** of the remaining candidates, the comment whose cosine distance to the table's nearest member is largest.
-- **Bridging:** the candidate with the highest probabilistic pairwise-disagreement score (`api/bridging.py`), with the table's linked pre-survey voters as the population. It needs at least two linked voters, and never repeats the maximin comment.
+- **Maximin** ranks candidates by their cosine distance to the table's nearest member, largest first.
+- **Bridging** ranks them by probabilistic pairwise-disagreement score (`api/bridging.py`), with the table's linked pre-survey voters as the population. It needs at least two linked voters.
 
-A part that cannot be computed (no approval matrix, fewer than two linked voters, failed embeddings) takes the best comment from `api/data/bridging_ranking.json`, the same score computed offline over every pre-survey voter (`api/scripts/rank_global_bridging.py`).
+A ranking that cannot be computed (no approval matrix, fewer than two linked voters, failed embeddings) uses `api/data/bridging_ranking.json` instead: the same bridging score computed offline over every pre-survey voter (`api/scripts/rank_global_bridging.py`).
+
+Comments are then assigned to every table's two slots jointly (`assign_statements`, solved with the Hungarian algorithm in `api/assignment.py`). Tables do not share a comment until there are more slots than candidates, and then as few comments as possible are reused, never twice at one table. Within that, the total rank lost across all slots is minimised, so a table often gets its second or third choice rather than a comment another table needs more. Each slot's log records the rank it received and the top choice it gave up.
 
 ## Text Response Transition
 
