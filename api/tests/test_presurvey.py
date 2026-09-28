@@ -203,7 +203,7 @@ class ServicePreSurveyTests(unittest.TestCase):
                 return self.calls.pop(0)
 
         service = TextMatchingService(
-            embedding_client=Client(), diffusion_statements=("s",),
+            embedding_client=Client(),
             optimization_seconds=0, approval_matrix_uri=uri,
         )
         with patch("text_match.log.log_event") as logged:

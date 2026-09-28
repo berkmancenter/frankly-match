@@ -4,7 +4,6 @@ import hashlib
 import math
 import os
 import random
-import threading
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -23,6 +22,7 @@ from presurvey import (
     link_participants,
     load_approval_matrix,
     load_comment_catalog,
+    load_eligible_comment_ids,
 )
 
 DiversityLevel = Literal["high", "medium", "low", "unknown"]
@@ -120,28 +120,6 @@ DUMMY_PARTICIPANT_STATEMENTS = (
     "Labor policy should give employers greater flexibility in hiring.",
 )
 
-DIFFUSION_STATEMENTS = (
-    "Political compromise is usually more valuable than ideological consistency.",
-    "Local communities should have more authority than national governments.",
-    "Economic inequality is a greater threat than slow economic growth.",
-    "Public institutions should favor experimentation even when it creates risk.",
-    "Individual freedom should take priority over collective security.",
-    "Experts should have more influence over policy than public opinion.",
-    "Long-term environmental goals justify meaningful short-term costs.",
-    "Essential services should not be operated for profit.",
-    "Social stability sometimes requires limiting rapid political change.",
-    "Technology companies should be responsible for the social effects of their products.",
-    "Equal outcomes matter more than equal opportunities.",
-    "People have stronger obligations to their local community than to strangers.",
-    "Governments should act on uncertain risks before conclusive evidence is available.",
-    "Democratic decisions are legitimate even when they produce inefficient outcomes.",
-    "A healthy society should tolerate views that most people find offensive.",
-    "Economic policy should prioritize resilience over maximum efficiency.",
-    "Public policy should reward personal responsibility more than compensate for disadvantage.",
-    "Future generations should have formal representation in present-day decisions.",
-)
-
-
 class EmbeddingClient(Protocol):
     def embed(self, sentences: Sequence[str]) -> np.ndarray:
         ...
@@ -155,6 +133,8 @@ class PreSurveyContext:
     catalog: CommentCatalog | None
     matrix: ApprovalMatrix | None
     links: dict[str, Link]
+    # Catalog rows of the diffusion topic's screened-eligible comments.
+    candidate_rows: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -781,19 +761,71 @@ def _log_event_design(design: EventDesign, request=None) -> None:
         )
 
 
-def select_diffusion_statement(
-    group_embeddings: np.ndarray,
-    statement_embeddings: np.ndarray,
-    statements: Sequence[str],
-) -> str:
-    group_matrix = _normalize_rows(group_embeddings)
-    statement_matrix = _normalize_rows(statement_embeddings)
-    if statement_matrix.shape[0] != len(statements):
-        raise ValueError("statement embedding count must match statement count")
+def maximin_scores(
+    member_embeddings: np.ndarray, candidate_embeddings: np.ndarray
+) -> np.ndarray:
+    """Each candidate's cosine distance to its closest group member.
 
-    distances = 1.0 - np.clip(group_matrix @ statement_matrix.T, -1.0, 1.0)
-    minimum_distances = distances.min(axis=0)
-    return list(statements)[int(np.argmax(minimum_distances))]
+    The pick is the candidate with the highest score: the comment furthest
+    from whoever at the table is nearest to it, so no one's own view is
+    simply echoed back.
+    """
+    members = _normalize_rows(member_embeddings)
+    candidates = _normalize_rows(candidate_embeddings)
+    if members.shape[1] != candidates.shape[1]:
+        raise ValueError(
+            f"member embeddings have {members.shape[1]} dimensions, "
+            f"candidates have {candidates.shape[1]}"
+        )
+    distances = 1.0 - np.clip(members @ candidates.T, -1.0, 1.0)
+    return distances.min(axis=0)
+
+
+@dataclass(frozen=True)
+class DiffusionPick:
+    comment_id: str
+    text: str
+    score: float
+    runner_up_id: str | None
+    runner_up_score: float | None
+    own_comments_skipped: int
+
+
+def pick_diffusion_comment(
+    member_embeddings: np.ndarray,
+    context: PreSurveyContext,
+    member_ids: Sequence[str],
+) -> DiffusionPick | None:
+    """Maximin pick among eligible comments not written by anyone at the table.
+
+    Authorship is known only for members linked to the pre-survey. Returns
+    None when no candidate remains.
+    """
+    catalog = context.catalog
+    authors = {
+        context.links[pid].presurvey_pid
+        for pid in member_ids
+        if pid in context.links and context.links[pid].presurvey_pid
+    }
+    rows = [
+        row for row in context.candidate_rows
+        if catalog.comments[row].author_pid not in authors
+    ]
+    if not rows:
+        return None
+    scores = maximin_scores(member_embeddings, catalog.embeddings[rows])
+    order = np.argsort(-scores, kind="stable")
+    best = rows[order[0]]
+    runner_up = rows[order[1]] if len(rows) > 1 else None
+    return DiffusionPick(
+        comment_id=catalog.comments[best].comment_id,
+        # Collapse line breaks so the comment cannot break the A/B layout.
+        text=" ".join(catalog.comments[best].text.split()),
+        score=float(scores[order[0]]),
+        runner_up_id=catalog.comments[runner_up].comment_id if runner_up is not None else None,
+        runner_up_score=float(scores[order[1]]) if runner_up is not None else None,
+        own_comments_skipped=len(context.candidate_rows) - len(rows),
+    )
 
 
 def _provenance(name: str) -> str | None:
@@ -811,16 +843,12 @@ class TextMatchingService:
     def __init__(
         self,
         embedding_client: EmbeddingClient | None = None,
-        diffusion_statements: Sequence[str] = DIFFUSION_STATEMENTS,
         optimization_seconds: float = 30.0,
         approval_matrix_uri: str | None = None,
     ):
         self.embedding_client = embedding_client or HuggingFaceEmbeddingClient()
-        self.diffusion_statements = tuple(diffusion_statements)
         self.optimization_seconds = optimization_seconds
         self.approval_matrix_uri = approval_matrix_uri
-        self._diffusion_embeddings: np.ndarray | None = None
-        self._diffusion_lock = threading.Lock()
 
     @classmethod
     def from_environment(cls) -> "TextMatchingService":
@@ -860,7 +888,6 @@ class TextMatchingService:
             "code_revision": _provenance("MATCH_CODE_REVISION"),
             "embedding_model": _provenance("HF_MODEL_ID"),
             "embedding_model_revision": _provenance("HF_MODEL_REVISION"),
-            "diffusion_statements": list(self.diffusion_statements),
         })
 
         try:
@@ -925,43 +952,60 @@ class TextMatchingService:
         _log_event_design(design, request)
 
         # Groups are final from here on. Nothing below may change or fail them.
-        self._load_presurvey(identities or {}, request)
+        context = self._load_presurvey(identities or {}, request)
 
         embedding_by_id = {
             participant_id: participant_embeddings[index]
             for index, participant_id in enumerate(participant_ids)
         }
-        flat = [
-            (arm, group, achieved)
-            for arm in design.arms
-            for group, achieved in zip(arm.groups, arm.achieved)
-        ]
+        results = []
+        picks_log = []
+        for arm in design.arms:
+            for group, achieved in zip(arm.groups, arm.achieved):
+                pick, reason = None, None
+                if context.catalog is None:
+                    reason = "catalog_unavailable"
+                else:
+                    try:
+                        pick = pick_diffusion_comment(
+                            np.vstack([embedding_by_id[pid] for pid in group]),
+                            context,
+                            group,
+                        )
+                        reason = None if pick else "no_candidates_left"
+                    except ValueError as exc:
+                        reason = f"pick_failed: {exc}"
+                results.append(self._build_group(
+                    arm, group, achieved,
+                    pick.text if pick else FALLBACK_STATEMENT,
+                    pick is None,
+                ))
+                picks_log.append({
+                    "participant_ids": group,
+                    "diversity_level": arm.level,
+                    "comment_id": pick.comment_id if pick else None,
+                    "text": pick.text if pick else None,
+                    "min_member_distance": pick.score if pick else None,
+                    "runner_up_id": pick.runner_up_id if pick else None,
+                    "runner_up_min_member_distance": pick.runner_up_score if pick else None,
+                    "own_comments_skipped": pick.own_comments_skipped if pick else None,
+                    "fallback_reason": reason,
+                })
 
-        try:
-            diffusion_embeddings = self._get_diffusion_embeddings()
-        except EmbeddingServiceError as exc:
+        log.log_event("INFO", "Diffusion picks", request, extra_data={
+            "method": "maximin_cosine_distance",
+            "candidate_count": len(context.candidate_rows),
+            "fallback_count": sum(1 for p in picks_log if p["fallback_reason"]),
+            "groups": picks_log,
+        })
+        if any(p["fallback_reason"] for p in picks_log):
             log.log_event(
                 "WARNING",
-                f"Diffusion statement embedding failed; using fallback statement: {exc}",
-                request=request,
-            )
-            return [
-                self._build_group(arm, group, achieved, FALLBACK_STATEMENT, True)
-                for arm, group, achieved in flat
-            ]
-
-        results = []
-        for arm, group, achieved in flat:
-            group_embeddings = np.vstack(
-                [embedding_by_id[participant_id] for participant_id in group]
-            )
-            statement = select_diffusion_statement(
-                group_embeddings,
-                diffusion_embeddings,
-                self.diffusion_statements,
-            )
-            results.append(
-                self._build_group(arm, group, achieved, statement, False)
+                "Some groups received the fallback diffusion statement",
+                request,
+                extra_data={"reasons": sorted({
+                    p["fallback_reason"] for p in picks_log if p["fallback_reason"]
+                })},
             )
         return results
 
@@ -972,6 +1016,7 @@ class TextMatchingService:
     ) -> PreSurveyContext:
         try:
             catalog = load_comment_catalog()
+            eligible = load_eligible_comment_ids()
         except Exception as exc:
             # The catalog ships with the code, so this is a broken deployment.
             log.log_event(
@@ -979,6 +1024,10 @@ class TextMatchingService:
             )
             return PreSurveyContext(catalog=None, matrix=None, links={})
 
+        candidate_rows = tuple(
+            row for row, comment in enumerate(catalog.comments)
+            if comment.topic_id == DIFFUSION_TOPIC_ID and comment.comment_id in eligible
+        )
         matrix = None
         matrix_error = None
         if not self.approval_matrix_uri:
@@ -996,6 +1045,7 @@ class TextMatchingService:
             "catalog_topic_counts": catalog.topic_counts(),
             "catalog_embedding_model": catalog.embedding_model,
             "catalog_embedding_revision": catalog.embedding_revision,
+            "diffusion_candidate_count": len(candidate_rows),
             "matrix_source": self.approval_matrix_uri,
             "matrix_loaded": matrix is not None,
             "matrix_error": matrix_error,
@@ -1023,7 +1073,9 @@ class TextMatchingService:
                 f"Approval matrix unavailable; nobody can be linked: {matrix_error}",
                 request,
             )
-            return PreSurveyContext(catalog=catalog, matrix=None, links={})
+            return PreSurveyContext(
+                catalog=catalog, matrix=None, links={}, candidate_rows=candidate_rows,
+            )
 
         links = link_participants(identities, matrix)
         counts = {"email": 0, "name": 0, "none": 0}
@@ -1050,7 +1102,9 @@ class TextMatchingService:
                 pid: ids for pid, ids in rows.items() if len(ids) > 1
             },
         })
-        return PreSurveyContext(catalog=catalog, matrix=matrix, links=links)
+        return PreSurveyContext(
+            catalog=catalog, matrix=matrix, links=links, candidate_rows=candidate_rows,
+        )
 
     @staticmethod
     def _build_group(
@@ -1068,14 +1122,6 @@ class TextMatchingService:
             assigned_target=arm.target,
             achieved_diversity=achieved,
         )
-
-    def _get_diffusion_embeddings(self) -> np.ndarray:
-        with self._diffusion_lock:
-            if self._diffusion_embeddings is None:
-                self._diffusion_embeddings = self.embedding_client.embed(
-                    self.diffusion_statements
-                )
-            return self._diffusion_embeddings
 
     def _fallback_groups(
         self,

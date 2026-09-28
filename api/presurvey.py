@@ -33,6 +33,9 @@ import numpy as np
 # topic the comment is drawn from.
 DIFFUSION_TOPIC_ID = "stocking_growing"
 CATALOG_PATH = Path(__file__).resolve().parent / "data" / "presurvey_comments.json"
+# Offline LLM screen of the diffusion topic's comments; see
+# scripts/judge_diffusion_comments.py. Only comments marked eligible are shown.
+ELIGIBILITY_PATH = Path(__file__).resolve().parent / "data" / "diffusion_eligibility.json"
 CATALOG_SCHEMA_VERSION = 1
 MATRIX_IDENTITY_COLUMNS = ("email", "name", "pid")
 UNIT_NORM_TOLERANCE = 1e-3
@@ -161,6 +164,16 @@ def parse_comment_catalog(raw: bytes) -> CommentCatalog:
 @lru_cache(maxsize=1)
 def load_comment_catalog() -> CommentCatalog:
     return parse_comment_catalog(CATALOG_PATH.read_bytes())
+
+
+@lru_cache(maxsize=1)
+def load_eligible_comment_ids() -> frozenset[str]:
+    document = json.loads(ELIGIBILITY_PATH.read_bytes())
+    return frozenset(
+        comment_id
+        for comment_id, entry in document["comments"].items()
+        if entry["eligible"]
+    )
 
 
 def parse_approval_matrix(

@@ -4,6 +4,8 @@ import os
 from unittest.mock import patch
 from itertools import combinations
 
+import json
+
 import numpy as np
 
 from embedding_client import EmbeddingServiceError
@@ -19,8 +21,35 @@ from text_match import (
     plan_arm_counts,
     plan_group_sizes,
     pool_mean_distance,
-    select_diffusion_statement,
+    PreSurveyContext,
+    maximin_scores,
+    pick_diffusion_comment,
 )
+from presurvey import Link, parse_comment_catalog
+
+
+def _catalog(entries):
+    """entries: (comment_id, topic_id, author_pid, text, [x, y])."""
+    return parse_comment_catalog(json.dumps({
+        "schema_version": 1,
+        "topics": {"stocking_growing": {}, "food_access": {}},
+        "embedding_metadata": {"dimensions": 2},
+        "comments": {
+            cid: {"comment_id": cid, "topic_id": topic, "author_pid": author,
+                  "text": text, "embedding": vector}
+            for cid, topic, author, text, vector in entries
+        },
+    }).encode())
+
+
+STUB_CATALOG = _catalog([
+    ("near", "stocking_growing", "pid_near", "near", [1.0, 0.0]),
+    ("side", "stocking_growing", "pid_side", "side  \n\n comment", [0.0, 1.0]),
+    ("far", "stocking_growing", "pid_far", "far", [-1.0, 0.0]),
+    ("screened_out", "stocking_growing", "pid_x", "screened out", [-1.0, 0.0]),
+    ("other_topic", "food_access", "pid_y", "other topic", [-1.0, 0.0]),
+])
+STUB_ELIGIBLE = frozenset({"near", "side", "far", "other_topic"})
 
 
 class QueueEmbeddingClient:
@@ -123,20 +152,46 @@ class DiversityTargetTests(unittest.TestCase):
             ),
         )
 
-    def test_selects_statement_with_best_minimum_distance(self):
-        group_embeddings = np.asarray([[1.0, 0.0], [0.8, 0.2]])
-        statement_embeddings = np.asarray(
-            [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]]
+    def test_maximin_scores_each_candidate_by_its_nearest_member(self):
+        members = np.asarray([[1.0, 0.0], [0.0, 1.0]])
+        candidates = np.asarray([[1.0, 0.0], [-1.0, 0.0], [-1.0, -1.0]])
+        scores = maximin_scores(members, candidates)
+        # [-1, -1] is 135 degrees from both members; [-1, 0] is only 90
+        # degrees from the second.
+        np.testing.assert_allclose(scores, [0.0, 1.0, 1.0 + 2 ** -0.5])
+
+    def test_maximin_refuses_mismatched_dimensions(self):
+        with self.assertRaises(ValueError):
+            maximin_scores(np.ones((2, 3)), np.ones((2, 2)))
+
+
+
+class DiffusionPickTests(unittest.TestCase):
+    CONTEXT = PreSurveyContext(
+        catalog=STUB_CATALOG, matrix=None, links={}, candidate_rows=(0, 1, 2),
+    )
+
+    def test_own_comments_are_skipped_for_linked_members(self):
+        links = {"p1": Link("p1", "email", 2, "pid_far")}
+        context = PreSurveyContext(
+            catalog=STUB_CATALOG, matrix=None, links=links, candidate_rows=(0, 1, 2),
         )
+        pick = pick_diffusion_comment(np.asarray([[1.0, 0.0]]), context, ["p1"])
+        # "far" is the maximin pick but p1 wrote it.
+        self.assertEqual(pick.comment_id, "side")
+        self.assertEqual(pick.own_comments_skipped, 1)
 
-        selected = select_diffusion_statement(
-            group_embeddings,
-            statement_embeddings,
-            ["near", "different", "opposite"],
+    def test_picked_text_has_whitespace_collapsed(self):
+        pick = pick_diffusion_comment(np.asarray([[0.0, -1.0]]), self.CONTEXT, ["p"])
+        self.assertEqual(pick.comment_id, "side")
+        self.assertEqual(pick.text, "side comment")
+
+    def test_no_candidates_left_returns_none(self):
+        context = PreSurveyContext(
+            catalog=STUB_CATALOG, matrix=None, candidate_rows=(2,),
+            links={"p": Link("p", "email", 0, "pid_far")},
         )
-
-        self.assertEqual(selected, "opposite")
-
+        self.assertIsNone(pick_diffusion_comment(np.asarray([[1.0, 0.0]]), context, ["p"]))
 
 
 class EventDesignTests(unittest.TestCase):
@@ -312,8 +367,7 @@ class TextMatchingServiceTests(unittest.TestCase):
     def test_logged_distances_reconstruct_group_diversity(self):
         embeddings = np.random.default_rng(7).normal(size=(100, 5))
         service = TextMatchingService(
-            embedding_client=QueueEmbeddingClient([embeddings, np.ones((1, 5))]),
-            diffusion_statements=("statement",), optimization_seconds=0,
+            embedding_client=QueueEmbeddingClient([embeddings, np.ones((1, 5))]), optimization_seconds=0,
         )
         with patch("text_match.log.log_event") as logged:
             groups = service.match({f"p{i}": f"text {i}" for i in range(100)}, 4)
@@ -344,8 +398,7 @@ class TextMatchingServiceTests(unittest.TestCase):
         says so, and the checksum still present."""
         embeddings = np.random.default_rng(3).normal(size=(12, 5))
         service = TextMatchingService(
-            embedding_client=QueueEmbeddingClient([embeddings, np.ones((1, 5))]),
-            diffusion_statements=("statement",), optimization_seconds=0,
+            embedding_client=QueueEmbeddingClient([embeddings, np.ones((1, 5))]), optimization_seconds=0,
         )
         with patch("text_match.DISTANCE_LOG_MAX_PARTICIPANTS", 10), patch("text_match.log.log_event") as logged:
             service.match({f"p{i}": f"text {i}" for i in range(12)}, 4)
@@ -363,8 +416,7 @@ class TextMatchingServiceTests(unittest.TestCase):
         Those must read as missing in the study export, not as recorded."""
         embeddings = np.random.default_rng(5).normal(size=(12, 5))
         service = TextMatchingService(
-            embedding_client=QueueEmbeddingClient([embeddings, np.ones((1, 5))]),
-            diffusion_statements=("statement",), optimization_seconds=0,
+            embedding_client=QueueEmbeddingClient([embeddings, np.ones((1, 5))]), optimization_seconds=0,
         )
         env = {"MATCH_CODE_REVISION": "   ", "HF_MODEL_REVISION": " abc123 "}
         with patch.dict(os.environ, env), patch("text_match.log.log_event") as logged:
@@ -378,47 +430,63 @@ class TextMatchingServiceTests(unittest.TestCase):
         self.assertIsNone(config["embedding_model"])
         self.assertEqual(config["embedding_model_revision"], "abc123")
 
-    def test_returns_diffusion_statement_for_each_group(self):
-        participant_embeddings = np.asarray(
-            [
-                [1.0, 0.0],
-                [0.7, 0.7],
-                [0.0, 1.0],
-                [-0.7, 0.7],
-                [-1.0, 0.0],
-                [-0.7, -0.7],
-            ]
-        )
-        diffusion_embeddings = np.asarray(
-            [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]]
-        )
-        service = TextMatchingService(
-            embedding_client=QueueEmbeddingClient(
-                [participant_embeddings, diffusion_embeddings]
-            ),
-            diffusion_statements=("first", "second", "third"),
+    def _stub_service(self, participant_embeddings):
+        return TextMatchingService(
+            embedding_client=QueueEmbeddingClient([participant_embeddings]),
             optimization_seconds=0,
         )
 
-        groups = service.match(
-            {f"p{index}": f"response {index}" for index in range(6)},
-            3,
-        )
+    def test_each_group_gets_an_eligible_diffusion_topic_comment(self):
+        service = self._stub_service(np.asarray(
+            [[1.0, 0.0], [0.9, 0.1], [0.8, 0.2], [1.0, 0.1], [0.7, 0.3], [0.95, 0.05]]
+        ))
+        with patch("text_match.load_comment_catalog", return_value=STUB_CATALOG), \
+                patch("text_match.load_eligible_comment_ids", return_value=STUB_ELIGIBLE), \
+                patch("text_match.log.log_event") as logged:
+            groups = service.match({f"p{i}": f"r{i}" for i in range(6)}, 3)
 
         self.assertEqual([len(group.participant_ids) for group in groups], [3, 3])
+        # Everyone sits near [1, 0], so the far comment wins. The screened-out
+        # and other-topic comments are just as far but never candidates.
+        self.assertTrue(all(group.diffusion_statement == "far" for group in groups))
         self.assertTrue(all(not group.fallback_used for group in groups))
-        # Two groups cannot identify three levels, so both are targeted at the
-        # pool mean rather than silently running a two-level design.
-        self.assertTrue(all(group.diversity_level == "medium" for group in groups))
-        self.assertTrue(
-            all(group.achieved_diversity is not None for group in groups)
+        record = next(
+            call.kwargs["extra_data"] for call in logged.call_args_list
+            if call.args[1] == "Diffusion picks"
         )
+        self.assertEqual(record["candidate_count"], 3)
+        self.assertEqual(record["groups"][0]["runner_up_id"], "side")
+        self.assertIsNone(record["groups"][0]["fallback_reason"])
+
+    def test_a_catalog_failure_preserves_optimized_groups(self):
+        service = self._stub_service(np.eye(6))
+        with patch("text_match.load_comment_catalog", side_effect=OSError("missing")), \
+                patch("text_match.log.log_event"):
+            groups = service.match({f"p{i}": f"r{i}" for i in range(6)}, 3)
+
+        self.assertTrue(all(group.fallback_used for group in groups))
+        # Only the pick failed, so the optimized groups and all their
+        # diversity measurements survive.
+        self.assertTrue(all(group.diversity_level != "unknown" for group in groups))
+        self.assertTrue(all(group.achieved_diversity is not None for group in groups))
         self.assertTrue(
-            all(
-                group.diffusion_statement in {"first", "second", "third"}
-                for group in groups
-            )
+            all(group.diffusion_statement == FALLBACK_STATEMENT for group in groups)
         )
+
+    def test_a_dimension_mismatch_falls_back_without_touching_groups(self):
+        """Registration embeddings from a different model than the catalog."""
+        service = self._stub_service(np.eye(6))
+        with patch("text_match.load_comment_catalog", return_value=STUB_CATALOG), \
+                patch("text_match.load_eligible_comment_ids", return_value=STUB_ELIGIBLE), \
+                patch("text_match.log.log_event") as logged:
+            groups = service.match({f"p{i}": f"r{i}" for i in range(6)}, 3)
+
+        self.assertTrue(all(group.fallback_used for group in groups))
+        self.assertTrue(all(group.achieved_diversity is not None for group in groups))
+        self.assertTrue(any(
+            call.args[0] == "WARNING" and "fallback diffusion" in call.args[1]
+            for call in logged.call_args_list
+        ))
 
     def test_participant_embedding_failure_uses_random_fallback(self):
         service = TextMatchingService(
@@ -443,39 +511,6 @@ class TextMatchingServiceTests(unittest.TestCase):
             all(group.achieved_diversity is None for group in groups)
         )
         self.assertTrue(all(group.assigned_target is None for group in groups))
-        self.assertTrue(
-            all(
-                group.diffusion_statement == FALLBACK_STATEMENT
-                for group in groups
-            )
-        )
-
-    def test_statement_embedding_failure_preserves_optimized_groups(self):
-        participant_embeddings = np.eye(6)
-        service = TextMatchingService(
-            embedding_client=QueueEmbeddingClient(
-                [
-                    participant_embeddings,
-                    EmbeddingServiceError("offline"),
-                ]
-            ),
-            optimization_seconds=0,
-        )
-
-        groups = service.match(
-            {f"p{index}": f"response {index}" for index in range(6)},
-            3,
-        )
-
-        self.assertTrue(all(group.fallback_used for group in groups))
-        self.assertTrue(
-            all(group.diversity_level != "unknown" for group in groups)
-        )
-        # Only statement selection failed, so the optimized groups and all their
-        # diversity measurements survive.
-        self.assertTrue(
-            all(group.achieved_diversity is not None for group in groups)
-        )
         self.assertTrue(
             all(
                 group.diffusion_statement == FALLBACK_STATEMENT
