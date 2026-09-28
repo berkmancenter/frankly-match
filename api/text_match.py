@@ -906,6 +906,7 @@ class EventAssignment:
     max_uses_per_comment: int
     total_rank: int
     collision_rounds: int
+    unresolved_collisions: int = 0
 
 
 def assign_statements(
@@ -922,9 +923,13 @@ def assign_statements(
 
     A table must not show the same comment twice, which the assignment itself
     cannot express once comments are reused. So after solving, a table that
-    got one comment in both slots has it forbidden for whichever slot ranks it
-    lower, and the event is solved again. Each round only adds constraints,
-    and collisions are rare, so this ends quickly.
+    got one comment in both slots has it ruled out for whichever slot ranks it
+    lower (or the other slot, if that is already ruled out), and the event is
+    solved again. Every round rules out at least one new pairing or stops, so
+    the loop always ends. A duplicate is the worst outcome, worse even than
+    showing a table its own comment: it removes the table's comparison. A
+    collision that nothing can resolve (a single candidate) is kept and
+    counted rather than retried forever.
     """
     catalog = context.catalog
     candidates = context.candidate_rows
@@ -933,16 +938,20 @@ def assign_statements(
     ranks = np.vstack([slot.ranks() for slot in preferences])
     forbidden = ~np.vstack([slot.allowed for slot in preferences])
 
-    # Costs are lexicographic: a forbidden pairing (a table's own comment, or
-    # one a collision round ruled out) outweighs any number of reuses, and a
-    # reuse outweighs any total rank.
-    reuse_cost = len(preferences) * count + 1.0
-    forbidden_cost = len(preferences) * (count + uses * reuse_cost) + 1.0
+    # Costs are lexicographic, each tier outweighing everything below it:
+    # a pairing ruled out to break a duplicate, then a table's own comment,
+    # then a reuse, then rank.
+    slots = len(preferences)
+    reuse_cost = slots * count + 1.0
+    own_cost = slots * (count + uses * reuse_cost) + 1.0
+    duplicate_cost = slots * own_cost * 2 + 1.0
+    ruled_out = np.zeros_like(forbidden)
 
     rounds = 0
+    unresolved = 0
     while True:
         rounds += 1
-        cost = np.where(forbidden, forbidden_cost, ranks)
+        cost = np.where(ruled_out, duplicate_cost, np.where(forbidden, own_cost, ranks))
         picked = min_cost_assignment(
             np.hstack([cost + copy * reuse_cost for copy in range(uses)])
         ) % count
@@ -955,10 +964,21 @@ def assign_statements(
         ]
         if not collisions:
             break
+        progress = False
         for first, second in collisions:
             column = picked[first]
-            worse = first if ranks[first, column] > ranks[second, column] else second
-            forbidden[worse, column] = True
+            worse, better = (
+                (first, second) if ranks[first, column] > ranks[second, column]
+                else (second, first)
+            )
+            for slot in (worse, better):
+                if not ruled_out[slot, column]:
+                    ruled_out[slot, column] = True
+                    progress = True
+                    break
+        if not progress:
+            unresolved = len(collisions)
+            break
 
     choices = []
     for index, slot in enumerate(preferences):
@@ -983,6 +1003,7 @@ def assign_statements(
         max_uses_per_comment=uses,
         total_rank=int(sum(choice.rank for choice in choices)),
         collision_rounds=rounds - 1,
+        unresolved_collisions=unresolved,
     )
 
 
@@ -1189,10 +1210,18 @@ class TextMatchingService:
             "max_uses_per_comment": assignment.max_uses_per_comment,
             "total_rank": assignment.total_rank,
             "collision_rounds": assignment.collision_rounds,
+            "unresolved_collisions": assignment.unresolved_collisions,
             "maximin_fallback_count": sum(1 for r in records if r["maximin"]["fallback_reason"]),
             "bridging_fallback_count": sum(1 for r in records if r["bridging"]["fallback_reason"]),
             "groups": records,
         })
+        if assignment.unresolved_collisions:
+            log.log_event(
+                "WARNING",
+                f"{assignment.unresolved_collisions} table(s) show the same comment in "
+                f"both slots: no other candidate was available to them",
+                request,
+            )
         reasons = sorted({
             record[method]["fallback_reason"]
             for record in records for method in ("maximin", "bridging")

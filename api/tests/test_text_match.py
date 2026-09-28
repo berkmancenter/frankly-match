@@ -279,6 +279,26 @@ class AssignmentTests(unittest.TestCase):
         for t in range(3):
             self.assertNotEqual(result.choices[2 * t].comment_id, result.choices[2 * t + 1].comment_id)
 
+    def test_a_duplicate_is_worse_than_showing_a_table_its_own_comment(self):
+        """The table's members wrote "near" and "side", leaving only "far".
+        Rather than show "far" twice, one slot gets a member's own comment."""
+        links = {"a": Link("a", "email", 0, "pid_near"), "b": Link("b", "email", 1, "pid_side")}
+        result = _assign(_context(links=links, matrix=None), [(["a", "b"], np.asarray([[1.0, 0.0]] * 2))])
+        ids = [c.comment_id for c in result.choices]
+        self.assertEqual(ids[0], "far")
+        self.assertNotEqual(ids[0], ids[1])
+        self.assertEqual(result.unresolved_collisions, 0)
+
+    def test_an_unresolvable_collision_ends_instead_of_looping(self):
+        """Regression: with a single candidate both slots must share it. This
+        used to retry forever."""
+        context = PreSurveyContext(
+            catalog=STUB_CATALOG, matrix=None, links={}, candidate_rows=(2,), fallback_rows=(2,),
+        )
+        result = _assign(context, [(["a"], np.asarray([[1.0, 0.0]]))])
+        self.assertEqual([c.comment_id for c in result.choices], ["far", "far"])
+        self.assertEqual(result.unresolved_collisions, 1)
+
     def test_the_assignment_minimises_total_rank(self):
         """Brute force over every way to give 2 tables' 4 slots distinct
         comments from 6 candidates."""
