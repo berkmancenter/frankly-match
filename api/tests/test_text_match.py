@@ -10,8 +10,10 @@ from embedding_client import EmbeddingServiceError
 from text_match import (
     FALLBACK_STATEMENT,
     assign_sizes_to_arms,
+    average_question_distances,
     design_event,
     MEDIUM_ARM_WEIGHT,
+    NoSharedQuestions,
     TARGET_PULL_IN,
     TextMatchingService,
     cosine_distance_matrix,
@@ -308,7 +310,108 @@ class EventDesignTests(unittest.TestCase):
         self.assertAlmostEqual(design.medium_target, design.pool_mean)
 
 
+def _unit(angle_degrees):
+    radians = np.deg2rad(angle_degrees)
+    return [np.cos(radians), np.sin(radians)]
+
+
+class QuestionDistanceTests(unittest.TestCase):
+    def test_distances_average_over_shared_questions_only(self):
+        keys = [("a", "q1"), ("a", "q2"), ("b", "q1"), ("b", "q2"), ("c", "q1")]
+        embeddings = np.asarray([_unit(0), _unit(0), _unit(90), _unit(180), _unit(0)])
+        result = average_question_distances(["a", "b", "c"], keys, embeddings)
+        # a-b: q1 is 90 degrees apart (d=1), q2 is 180 (d=2); mean 1.5.
+        self.assertAlmostEqual(result.distances[0, 1], 1.5)
+        # a-c and b-c share only q1.
+        self.assertAlmostEqual(result.distances[0, 2], 0.0)
+        self.assertAlmostEqual(result.distances[1, 2], 1.0)
+        np.testing.assert_array_equal(result.distances, result.distances.T)
+        self.assertEqual(result.shared_counts[0, 1], 2)
+        self.assertEqual(result.shared_counts[0, 2], 1)
+        self.assertEqual(result.answers_per_question, {"q1": 3, "q2": 2})
+        self.assertEqual(result.unshared_pairs, 0)
+        self.assertIsNone(result.fill_distance)
+
+    def test_opposite_disagreements_do_not_cancel(self):
+        """The reason distances are averaged rather than embeddings. a and b
+        disagree on both questions in opposite directions; their averaged
+        embeddings coincide, but their averaged distance does not vanish."""
+        keys = [("a", "q1"), ("a", "q2"), ("b", "q1"), ("b", "q2")]
+        embeddings = np.asarray([_unit(45), _unit(-45), _unit(-45), _unit(45)])
+        result = average_question_distances(["a", "b"], keys, embeddings)
+        self.assertAlmostEqual(result.distances[0, 1], 1.0)
+        mean_a = embeddings[:2].mean(axis=0)
+        mean_b = embeddings[2:].mean(axis=0)
+        self.assertAlmostEqual(cosine_distance_matrix(np.vstack([mean_a, mean_b]))[0, 1], 0.0)
+
+    def test_unshared_pairs_take_the_mean_and_keep_the_pool_mean(self):
+        keys = [("a", "q1"), ("b", "q1"), ("c", "q1"), ("d", "q2")]
+        embeddings = np.asarray([_unit(0), _unit(90), _unit(180), _unit(0)])
+        result = average_question_distances(["a", "b", "c", "d"], keys, embeddings)
+        known = [result.distances[0, 1], result.distances[0, 2], result.distances[1, 2]]
+        self.assertEqual(result.unshared_pairs, 3)
+        self.assertAlmostEqual(result.fill_distance, np.mean(known))
+        for other in range(3):
+            self.assertAlmostEqual(result.distances[3, other], result.fill_distance)
+        self.assertAlmostEqual(pool_mean_distance(result.distances), np.mean(known))
+
+    def test_no_shared_question_at_all_is_an_error(self):
+        keys = [("a", "q1"), ("b", "q2")]
+        with self.assertRaises(NoSharedQuestions):
+            average_question_distances(["a", "b"], keys, np.eye(2))
+
+
 class TextMatchingServiceTests(unittest.TestCase):
+    def test_every_answer_is_embedded_and_grouped_by_question(self):
+        """One embedding per answer; group diversity is measured on the
+        per-question average, not on any single answer."""
+        rng = np.random.default_rng(11)
+        answers = {
+            f"p{i}": {"q1": f"food {i}", "q2": f"housing {i}", "q3": f"transit {i}"}
+            for i in range(9)
+        }
+        del answers["p0"]["q3"]
+        embeddings = rng.normal(size=(26, 4))
+
+        class RecordingClient(QueueEmbeddingClient):
+            def embed(self, sentences):
+                self.sentences = getattr(self, "sentences", None) or list(sentences)
+                return super().embed(sentences)
+
+        client = RecordingClient([embeddings, np.ones((1, 4))])
+        service = TextMatchingService(
+            embedding_client=client, diffusion_statements=("statement",), optimization_seconds=0,
+        )
+        with patch("text_match.log.log_event") as logged:
+            groups = service.match(answers, 3)
+
+        self.assertEqual(len(client.sentences), 26)
+        self.assertEqual(client.sentences[:2], ["food 0", "housing 0"])
+        keys = [(pid, q) for pid in answers for q in answers[pid]]
+        expected = average_question_distances(list(answers), keys, embeddings).distances
+        index = {pid: i for i, pid in enumerate(answers)}
+        for group in groups:
+            pairs = list(combinations([index[p] for p in group.participant_ids], 2))
+            self.assertAlmostEqual(
+                group.achieved_diversity, np.mean([expected[a, b] for a, b in pairs])
+            )
+        coverage = next(
+            call.kwargs["extra_data"] for call in logged.call_args_list
+            if "answers_per_question" in call.kwargs.get("extra_data", {})
+        )
+        self.assertEqual(coverage["answers_per_question"], {"q1": 9, "q2": 9, "q3": 8})
+        self.assertEqual(coverage["unshared_pairs"], 0)
+
+    def test_no_shared_question_falls_back_to_random_groups(self):
+        service = TextMatchingService(
+            embedding_client=QueueEmbeddingClient([np.eye(6)]), optimization_seconds=0,
+        )
+        answers = {f"p{i}": {f"q{i}": f"text {i}"} for i in range(6)}
+        with patch("text_match.log.log_event"):
+            groups = service.match(answers, 3)
+        self.assertTrue(all(group.diversity_level == "unknown" for group in groups))
+        self.assertEqual(sorted(p for g in groups for p in g.participant_ids), sorted(answers))
+
     def test_logged_distances_reconstruct_group_diversity(self):
         embeddings = np.random.default_rng(7).normal(size=(100, 5))
         service = TextMatchingService(

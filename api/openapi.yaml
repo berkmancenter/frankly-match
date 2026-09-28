@@ -85,9 +85,9 @@ paths:
 
         diversityLevel reports which arm a group was randomized into and is the regressor for analysis. If embedding fails, the API returns size-preserving random groups with diversityLevel "unknown" and the fallback diffusion statement; the failure is logged as a WARNING.
 
-        With REQUIRE_REAL_TEXT set, a participant missing freeTextResponse causes a 422 MISSING_TEXT_RESPONSES listing the affected ids, rather than silent placeholder substitution.
+        With REQUIRE_REAL_TEXT set, a participant with no non-empty freeTextResponses or freeTextResponse causes a 422 MISSING_TEXT_RESPONSES listing the affected ids, rather than silent placeholder substitution.
 
-        Until freeTextResponse is supplied by the upstream survey payload, missing text responses receive deterministic development placeholders.
+        Until free text is supplied by the upstream survey payload, participants without it receive deterministic development placeholders.
 
         Optional studyId and eventId link matching logs to study records. The X-Match-Run-ID response header identifies this attempt and is present on every response, including 400/422 validation failures and 500 errors; save it with the groups actually used. Group IDs are unique only within a run.
       tags: [Matching]
@@ -180,7 +180,7 @@ definitions:
     description: |
       Per-participant survey data. The selected algorithm determines which field it reads.
 
-      freeTextResponse is temporarily optional for textGroupMatch while the upstream survey payload is being extended. Missing values receive deterministic placeholders.
+      textGroupMatch reads freeTextResponses (one answer per question) or, for a single answer, freeTextResponse. Both are temporarily optional while the upstream survey payload is being extended; a participant with neither receives a deterministic placeholder.
     properties:
       binaryAnswerMask:
         type: string
@@ -197,6 +197,18 @@ definitions:
         description: |
           Free-form survey response embedded by textGroupMatch. Whitespace-only or missing values currently receive a development placeholder.
         example: "Public transit should be free in major cities."
+      freeTextResponses:
+        type: object
+        additionalProperties:
+          type: string
+        description: |
+          Free-text answers for textGroupMatch, keyed by the caller's question id (e.g. Frankly's registration question id). Answers are only compared with answers to the same question id: textGroupMatch computes a cosine distance per question and averages it over the questions both participants answered.
+
+          Null, blank or missing answers are dropped. When both freeTextResponses and freeTextResponse are sent, only freeTextResponses is used and a warning is logged. A participant with neither is treated as having no text (see REQUIRE_REAL_TEXT).
+        example:
+          q_fresh_food: "We need a grocery store within walking distance."
+          q_housing: "Rents are rising faster than wages."
+          q_transit: "The bus routes don't connect to where people work."
       email:
         type: string
         description: |
