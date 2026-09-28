@@ -1,0 +1,15 @@
+{
+  "description": "Hand overrides of diffusion_eligibility.json verdicts. An entry here replaces the judge's eligible verdict for that comment; re-running the judge never touches this file.",
+  "overrides": {
+    "9a8b12f3-943c-40f4-b7be-7142ba796fa9": {
+      "eligible": false,
+      "text": "Non-gmo grass finished beef \n\n\n\nKosher food options \n\n\n\nOrganic food only",
+      "note": "A list of shopping preferences, not an approach for neighborhoods that lack fresh food. Eligible only on a 2-1 on_topic vote."
+    },
+    "da1089e8-4ecc-4c18-914b-2ae72ffa3952": {
+      "eligible": false,
+      "text": "They can have outside vendors that do fresh",
+      "note": "'They' cannot be resolved; excluded for consistency with 'Give them the lots to grow'."
+    }
+  }
+}
