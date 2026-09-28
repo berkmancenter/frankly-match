@@ -56,9 +56,7 @@ Each text-matched group also receives a reusable `diffusionStatement`. The selec
 
 ## Text Response Transition
 
-A participant sends either `freeTextResponses`, a map from question id to answer, or a single `freeTextResponse`. Answers are only compared with answers to the same question: `textGroupMatch` computes a cosine distance per question and averages it over the questions both people answered. Averaging distances, rather than embeddings, stops opposite disagreements on different topics from cancelling out. A pair with no question in common gets the mean distance of the other pairs, which leaves the pool mean unchanged.
-
-Neither field is yet guaranteed by the upstream survey payload. During this transition, participants with no text receive deterministic development placeholders. The replacement point is marked with a TODO in `api/main.py`.
+`freeTextResponse` is defined in the API contract but is not yet guaranteed by the upstream survey payload. During this transition, missing text responses receive deterministic development placeholders. The replacement point is marked with a TODO in `api/main.py`.
 
 ## Local API
 

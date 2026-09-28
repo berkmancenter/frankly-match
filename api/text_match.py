@@ -26,9 +26,6 @@ from presurvey import (
 )
 
 DiversityLevel = Literal["high", "medium", "low", "unknown"]
-# Question id for a participant who sent one freeTextResponse rather than a
-# freeTextResponses map. Every such answer is treated as the same question.
-SINGLE_RESPONSE_QUESTION_ID = "freeTextResponse"
 FALLBACK_STATEMENT = "FALLBACK STATEMENT"
 MIN_TEXT_GROUP_SIZE = 3
 EXACT_BOUND_COMBINATION_LIMIT = 20_000
@@ -237,68 +234,6 @@ def cosine_distance_matrix(embeddings: np.ndarray) -> np.ndarray:
     distances = 1.0 - similarities
     np.fill_diagonal(distances, 0.0)
     return distances
-
-
-class NoSharedQuestions(ValueError):
-    """No two participants answered a common question, so no distance exists."""
-
-
-@dataclass(frozen=True)
-class QuestionDistances:
-    distances: np.ndarray
-    shared_counts: np.ndarray
-    answers_per_question: dict[str, int]
-    unshared_pairs: int
-    fill_distance: float | None
-
-
-def average_question_distances(
-    participant_ids: Sequence[str],
-    answer_keys: Sequence[tuple[str, str]],
-    embeddings: np.ndarray,
-) -> QuestionDistances:
-    """Per-question cosine distances, averaged over the questions a pair shares.
-
-    Answers are only ever compared with answers to the same question. Averaging
-    distances rather than embeddings keeps each topic's disagreement intact:
-    averaging vectors first lets opposite disagreements on different topics
-    cancel. answer_keys[r] is the (participant_id, question_id) of embeddings[r].
-
-    A pair with no question in common gets the mean of the defined pairs, which
-    leaves the pool mean -- and so every diversity target -- unchanged.
-    """
-    ids = list(participant_ids)
-    index_of = {pid: i for i, pid in enumerate(ids)}
-    rows_by_question: dict[str, list[int]] = {}
-    for row, (_, question_id) in enumerate(answer_keys):
-        rows_by_question.setdefault(question_id, []).append(row)
-
-    n = len(ids)
-    total = np.zeros((n, n))
-    shared = np.zeros((n, n), dtype=int)
-    for rows in rows_by_question.values():
-        people = [index_of[answer_keys[row][0]] for row in rows]
-        block = np.ix_(people, people)
-        total[block] += cosine_distance_matrix(embeddings[rows])
-        shared[block] += 1
-
-    off_diagonal = ~np.eye(n, dtype=bool)
-    known = off_diagonal & (shared > 0)
-    if not known.any():
-        raise NoSharedQuestions("no two participants answered a common question")
-    distances = np.zeros((n, n))
-    distances[known] = total[known] / shared[known]
-    unknown = off_diagonal & ~known
-    fill = float(distances[known].mean()) if unknown.any() else None
-    if fill is not None:
-        distances[unknown] = fill
-    return QuestionDistances(
-        distances=distances,
-        shared_counts=shared,
-        answers_per_question={q: len(rows) for q, rows in rows_by_question.items()},
-        unshared_pairs=int(unknown.sum()) // 2,
-        fill_distance=fill,
-    )
 
 
 def pool_mean_distance(distances: np.ndarray) -> float:
@@ -901,27 +836,13 @@ class TextMatchingService:
 
     def match(
         self,
-        participant_responses: dict[str, str | dict[str, str]],
+        participant_responses: dict[str, str],
         target_group_size: int,
         request=None,
         identities: dict[str, tuple[str | None, str | None]] | None = None,
     ) -> list[TextMatchGroup]:
-        """participant_responses maps each id to {question_id: answer}. A bare
-        string is one answer to SINGLE_RESPONSE_QUESTION_ID. identities maps
-        each id to (email, name) for linking to the pre-survey."""
+        """identities maps each id to (email, name) for linking to the pre-survey."""
         participant_ids = list(participant_responses)
-        answers = {
-            pid: (
-                {SINGLE_RESPONSE_QUESTION_ID: value}
-                if isinstance(value, str) else dict(value)
-            )
-            for pid, value in participant_responses.items()
-        }
-        answer_keys = [
-            (pid, question_id)
-            for pid in participant_ids
-            for question_id in answers[pid]
-        ]
         group_sizes = plan_group_sizes(len(participant_ids), target_group_size)
         seed = _stable_seed(participant_ids)
         log.log_event("INFO", "Matching configuration", request, extra_data={
@@ -935,7 +856,7 @@ class TextMatchingService:
             "endpoint_restarts": ENDPOINT_RESTARTS,
             "convergence_tolerance": CONVERGENCE_TOLERANCE,
             "medium_arm_weight": MEDIUM_ARM_WEIGHT,
-            "diversity_metric": "mean_pairwise_cosine_distance_averaged_over_shared_questions",
+            "diversity_metric": "mean_pairwise_cosine_distance",
             "code_revision": _provenance("MATCH_CODE_REVISION"),
             "embedding_model": _provenance("HF_MODEL_ID"),
             "embedding_model_revision": _provenance("HF_MODEL_REVISION"),
@@ -943,29 +864,13 @@ class TextMatchingService:
         })
 
         try:
-            answer_embeddings = self.embedding_client.embed(
-                [answers[pid][question_id] for pid, question_id in answer_keys]
+            participant_embeddings = self.embedding_client.embed(
+                list(participant_responses.values())
             )
         except EmbeddingServiceError as exc:
             log.log_event(
                 "WARNING",
                 f"Participant embedding failed; using random fallback: {exc}",
-                request=request,
-                extra_data={
-                    "participant_count": len(participant_ids),
-                    "answer_count": len(answer_keys),
-                },
-            )
-            return self._fallback_groups(participant_ids, group_sizes, seed)
-
-        try:
-            question_distances = average_question_distances(
-                participant_ids, answer_keys, answer_embeddings
-            )
-        except NoSharedQuestions as exc:
-            log.log_event(
-                "WARNING",
-                f"No distances could be formed; using random fallback: {exc}",
                 request=request,
                 extra_data={"participant_count": len(participant_ids)},
             )
@@ -974,24 +879,7 @@ class TextMatchingService:
         # Randomisation into condition pools happens here, after embedding, so a
         # REQUIRE_REAL_TEXT failure aborts before anyone is assigned, and before
         # any distance-based decision is taken.
-        distances = question_distances.distances
-        log.log_event("INFO", "Question coverage", request, extra_data={
-            "answer_count": len(answer_keys),
-            "answers_per_question": question_distances.answers_per_question,
-            "unshared_pairs": question_distances.unshared_pairs,
-            "fill_distance": question_distances.fill_distance,
-        })
-        if question_distances.unshared_pairs:
-            log.log_event(
-                "WARNING",
-                f"{question_distances.unshared_pairs} participant pair(s) share no "
-                f"answered question; their distance is the mean of the other pairs",
-                request,
-                extra_data={
-                    "unshared_pairs": question_distances.unshared_pairs,
-                    "fill_distance": question_distances.fill_distance,
-                },
-            )
+        distances = cosine_distance_matrix(participant_embeddings)
         participant_count = len(participant_ids)
         entry_count = 0
         rows_logged = participant_count <= DISTANCE_LOG_MAX_PARTICIPANTS
@@ -1019,7 +907,7 @@ class TextMatchingService:
             )
         log.log_event("INFO", "Participant distances complete", request, extra_data={
             "participant_count": participant_count,
-            "embedding_dimensions": int(answer_embeddings.shape[1]),
+            "embedding_dimensions": int(participant_embeddings.shape[1]),
             "rows_logged": rows_logged,
             "entry_count": entry_count,
             "max_participants": DISTANCE_LOG_MAX_PARTICIPANTS,
@@ -1039,12 +927,10 @@ class TextMatchingService:
         # Groups are final from here on. Nothing below may change or fail them.
         self._load_presurvey(identities or {}, request)
 
-        # Every answer a table member gave is a row, so the pick is the statement
-        # furthest from everything anyone at the table wrote.
-        # TODO: Restrict to answers on the diffusion statement's topic.
-        rows_by_participant: dict[str, list[int]] = {}
-        for row, (pid, _) in enumerate(answer_keys):
-            rows_by_participant.setdefault(pid, []).append(row)
+        embedding_by_id = {
+            participant_id: participant_embeddings[index]
+            for index, participant_id in enumerate(participant_ids)
+        }
         flat = [
             (arm, group, achieved)
             for arm in design.arms
@@ -1066,9 +952,9 @@ class TextMatchingService:
 
         results = []
         for arm, group, achieved in flat:
-            group_embeddings = answer_embeddings[
-                [row for pid in group for row in rows_by_participant[pid]]
-            ]
+            group_embeddings = np.vstack(
+                [embedding_by_id[participant_id] for participant_id in group]
+            )
             statement = select_diffusion_statement(
                 group_embeddings,
                 diffusion_embeddings,

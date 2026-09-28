@@ -22,7 +22,6 @@ from pydantic import BaseModel, field_validator, model_validator
 
 from match import group_match
 from text_match import (
-    SINGLE_RESPONSE_QUESTION_ID,
     TextMatchingService,
     placeholder_responses,
     plan_group_sizes,
@@ -99,9 +98,6 @@ async def match_run_context(request: Request, call_next):
 class ParticipantData(BaseModel):
     binaryAnswerMask: str = ""
     freeTextResponse: Optional[str] = None
-    # Registration answers keyed by the caller's question id. Values may be
-    # null: a skipped question drops out rather than rejecting the event.
-    freeTextResponses: Optional[dict[str, Optional[str]]] = None
     # Identity is used only to link a participant to their pre-survey row, and
     # a person who cannot be linked still gets a table. So these are never
     # validated beyond trimming: a malformed email must not 422 the whole event.
@@ -188,7 +184,7 @@ class MissingTextResponses(Exception):
     def __init__(self, participant_ids: list[str]):
         self.participant_ids = participant_ids
         super().__init__(
-            f"{len(participant_ids)} participant(s) have no free-text answer"
+            f"{len(participant_ids)} participant(s) have no freeTextResponse"
         )
 
 
@@ -219,14 +215,14 @@ async def missing_text_handler(request: Request, exc: MissingTextResponses) -> J
     log.log_event(
         "ERROR",
         f"Refusing to match: {len(exc.participant_ids)} participant(s) "
-        f"with no free-text answer and REQUIRE_REAL_TEXT is set",
+        f"missing freeTextResponse and REQUIRE_REAL_TEXT is set",
         request=request,
         extra_data={"participant_ids_missing_text": exc.participant_ids},
     )
     return JSONResponse(
         {
             "code": "MISSING_TEXT_RESPONSES",
-            "message": "No non-empty freeTextResponses or freeTextResponse for: "
+            "message": "freeTextResponse missing or empty for: "
             + ", ".join(exc.participant_ids),
         },
         status_code=422,
@@ -265,39 +261,19 @@ def _normalize_masks(participants: dict[str, ParticipantData]) -> dict[str, str]
     }
 
 
-def _supplied_answers(data: ParticipantData) -> dict[str, str]:
-    """Non-blank answers keyed by question id.
-
-    freeTextResponses wins when both fields are sent, so a caller mid-migration
-    can keep sending the old field without it being embedded twice.
-    """
-    if data.freeTextResponses is not None:
-        return {
-            question_id.strip(): text.strip()
-            for question_id, text in data.freeTextResponses.items()
-            if question_id.strip() and text and text.strip()
-        }
-    single = data.freeTextResponse.strip() if data.freeTextResponse else ""
-    return {SINGLE_RESPONSE_QUESTION_ID: single} if single else {}
-
-
 def _text_responses(
     participants: dict[str, ParticipantData],
     request: Request | None = None,
-) -> dict[str, dict[str, str]]:
+) -> dict[str, str]:
     placeholders = placeholder_responses(list(participants))
-    responses: dict[str, dict[str, str]] = {}
+    responses: dict[str, str] = {}
     placeholder_ids: list[str] = []
-    both_fields_ids: list[str] = []
     for participant_id, data in participants.items():
-        if data.freeTextResponses is not None and data.freeTextResponse:
-            both_fields_ids.append(participant_id)
-        supplied = _supplied_answers(data)
-        # TODO: Remove placeholder responses once text is guaranteed in the payload.
+        supplied = data.freeTextResponse.strip() if data.freeTextResponse else ""
+        # TODO: Remove placeholder responses once freeTextResponse is guaranteed in the payload.
         if not supplied:
             placeholder_ids.append(participant_id)
-            supplied = {SINGLE_RESPONSE_QUESTION_ID: placeholders[participant_id]}
-        responses[participant_id] = supplied
+        responses[participant_id] = supplied or placeholders[participant_id]
 
     placeholder_set = set(placeholder_ids)
     # One-shot-event protection: groups formed from placeholder text are
@@ -317,29 +293,20 @@ def _text_responses(
             "participant_count": len(responses),
             "placeholder_count": len(placeholder_ids),
             "placeholder_participant_ids": placeholder_ids,
-            "both_fields_participant_ids": both_fields_ids,
             # This is what used to ride back in MatchResponse.participantResponses.
             "responses": [
                 {
                     "participant_id": participant_id,
                     "email": participants[participant_id].email,
                     "name": participants[participant_id].name,
-                    "answers": answers,
-                    "answer_count": len(answers),
+                    "response": text,
+                    "response_length": len(text),
                     "is_placeholder": participant_id in placeholder_set,
                 }
-                for participant_id, answers in responses.items()
+                for participant_id, text in responses.items()
             ],
         },
     )
-    if both_fields_ids:
-        log.log_event(
-            "WARNING",
-            f"{len(both_fields_ids)} participant(s) sent both freeTextResponses and "
-            f"freeTextResponse; only freeTextResponses was used",
-            request=request,
-            extra_data={"both_fields_participant_ids": both_fields_ids},
-        )
     return responses
 
 

@@ -183,7 +183,7 @@ class MatchApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(service.target_group_size, 3)
-        self.assertEqual(service.participant_responses["a"], {"freeTextResponse": "supplied response"})
+        self.assertEqual(service.participant_responses["a"], "supplied response")
         self.assertTrue(service.participant_responses["b"])
         self.assertTrue(service.participant_responses["c"])
         self.assertEqual(
@@ -225,7 +225,7 @@ class MatchApiTests(unittest.TestCase):
             if "responses" in call.kwargs.get("extra_data", {})
         )
         by_id = {entry["participant_id"]: entry for entry in logged["responses"]}
-        self.assertEqual(by_id["a"]["answers"], {"freeTextResponse": "supplied response"})
+        self.assertEqual(by_id["a"]["response"], "supplied response")
         self.assertFalse(by_id["a"]["is_placeholder"])
         self.assertTrue(by_id["b"]["is_placeholder"])
         self.assertEqual(logged["placeholder_count"], 2)
@@ -263,81 +263,6 @@ class MatchApiTests(unittest.TestCase):
         self.assertEqual(by_id["b"]["email"], "not-an-email")
         self.assertIsNone(by_id["b"]["name"])
         self.assertIsNone(by_id["c"]["email"])
-
-    def test_answer_map_reaches_the_service_by_question(self):
-        """freeTextResponses is passed through keyed by question id, with
-        null and blank answers dropped and ids trimmed."""
-        service = FakeTextMatchingService()
-        with patch.object(main, "get_text_matching_service", return_value=service):
-            response = self.client.post(
-                "/match",
-                json={
-                    "algorithm": "textGroupMatch",
-                    "targetGroupSize": 3,
-                    "participants": {
-                        "a": {"freeTextResponses": {" q1 ": " food ", "q2": "housing"}},
-                        "b": {"freeTextResponses": {"q1": "shops", "q2": None, "q3": "  "}},
-                        "c": {"freeTextResponse": "one answer"},
-                    },
-                },
-            )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(
-            service.participant_responses,
-            {
-                "a": {"q1": "food", "q2": "housing"},
-                "b": {"q1": "shops"},
-                "c": {"freeTextResponse": "one answer"},
-            },
-        )
-
-    def test_answer_map_wins_over_the_single_field_with_a_warning(self):
-        service = FakeTextMatchingService()
-        with patch.object(
-            main, "get_text_matching_service", return_value=service
-        ), patch.object(main.log, "log_event") as log_event:
-            response = self.client.post(
-                "/match",
-                json={
-                    "algorithm": "textGroupMatch",
-                    "targetGroupSize": 3,
-                    "participants": {
-                        "a": {"freeTextResponses": {"q1": "new"}, "freeTextResponse": "old"},
-                        "b": {"freeTextResponses": {"q1": "x"}},
-                        "c": {"freeTextResponses": {"q1": "y"}},
-                    },
-                },
-            )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(service.participant_responses["a"], {"q1": "new"})
-        warning = next(
-            call for call in log_event.call_args_list
-            if call.args[0] == "WARNING" and "both" in call.args[1]
-        )
-        self.assertEqual(warning.kwargs["extra_data"]["both_fields_participant_ids"], ["a"])
-
-    def test_all_blank_answers_count_as_missing_text(self):
-        service = FakeTextMatchingService()
-        with patch.object(main, "get_text_matching_service", return_value=service), \
-                patch.dict(main.os.environ, {"REQUIRE_REAL_TEXT": "1"}):
-            response = self.client.post(
-                "/match",
-                json={
-                    "algorithm": "textGroupMatch",
-                    "targetGroupSize": 3,
-                    "participants": {
-                        "a": {"freeTextResponses": {"q1": " ", "q2": None}},
-                        "b": {"freeTextResponses": {"q1": "x"}},
-                        "c": {"freeTextResponses": {"q1": "y"}},
-                    },
-                },
-            )
-
-        self.assertEqual(response.status_code, 422)
-        self.assertEqual(response.json()["code"], "MISSING_TEXT_RESPONSES")
-        self.assertIn("a", response.json()["message"])
 
     def test_text_diagnostics_go_to_the_logger(self):
         service = FakeTextMatchingService()
