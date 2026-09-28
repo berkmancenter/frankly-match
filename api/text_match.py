@@ -69,10 +69,10 @@ MEDIUM_ARM_WEIGHT = 2 ** 0.5
 # assignment by removing scatter rather than by shifting the mean.
 MIN_GROUPS_FOR_LEVELS = 3
 
-# Targets are pulled in from the achievable extremes by TARGET_PULL_IN of the
-# range. Targeting the exact floor or ceiling means the optimizer can only miss
-# inward, which makes assignment error one-sided; a symmetric margin keeps the
-# error roughly centered and the extreme arms reliably reachable.
+# Diagnostic only: each arm logs a margin of TARGET_PULL_IN of its achievable
+# floor-to-ceiling range. An earlier design pulled the endpoint targets in by
+# this margin; the endpoint arms now use minimax, which has no target, and the
+# medium target is the midpoint of the achieved endpoints. Nothing steers on it.
 TARGET_PULL_IN = 0.05
 
 # An arm is accepted when its restarts agree, not when it clears a fixed bound.
@@ -690,12 +690,14 @@ def design_event(
 def _log_event_design(design: EventDesign, request=None) -> None:
     """Per-event structured log: geometry, arm status, doses, separation.
 
-    Doses are also reported on the calibrated Bradley-Terry axis,
-    arccos(1 - d) / pi, the predicted fraction of voters who would split on a
-    pair at distance d.
+    Doses are also reported as an angle fraction, arccos(1 - d) / pi: for unit
+    embeddings at cosine distance d, the angle between them as a share of 180
+    degrees. Equivalently, the chance that a random hyperplane through the
+    origin separates them. It is a monotone rescaling of d for readability,
+    not a calibrated model of voters.
     """
 
-    def bradley_terry(distance: float) -> float:
+    def angle_fraction(distance: float) -> float:
         return math.acos(max(-1.0, min(1.0, 1.0 - distance))) / math.pi
 
     arms_payload = []
@@ -709,7 +711,7 @@ def _log_event_design(design: EventDesign, request=None) -> None:
                 "target": arm.target,
                 "achieved": arm.achieved,
                 "achieved_mean": float(np.mean(arm.achieved)),
-                "achieved_mean_bt": bradley_terry(float(np.mean(arm.achieved))),
+                "achieved_mean_angle_fraction": angle_fraction(float(np.mean(arm.achieved))),
                 "floor": arm.floor,
                 "ceiling": arm.ceiling,
                 "margin": arm.margin,
