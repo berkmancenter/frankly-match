@@ -117,7 +117,7 @@
     },
     "9a8b12f3-943c-40f4-b7be-7142ba796fa9": {
       "text": "Non-gmo grass finished beef \n\n\n\nKosher food options \n\n\n\nOrganic food only",
-      "eligible": true,
+      "eligible": false,
       "unanimous": false,
       "criteria": {
         "makes_proposal": {
@@ -213,7 +213,8 @@
             "pass": true
           }
         }
-      ]
+      ],
+      "excluded_by_hand": "A list of shopping preferences, not an approach for neighborhoods that lack fresh food. Eligible only on a 2-1 on_topic vote."
     },
     "5626af6d-1c56-41f8-aac8-6acfc397a1c7": {
       "text": "Full service grocery stores also offer employment in the neighborhood.  Any job that an individual can hold and can get to without having to rely on a car is a great thing.  And if it’s in a full service grocery store, that individual can also bring home quality food for their family. It’s time for the neighborhood of Hamilton Hill and State street to be given a chance to benefit from the developments happening downtown.  It would benefit the economic base of the downtown area as well.",
@@ -3417,7 +3418,7 @@
     },
     "da1089e8-4ecc-4c18-914b-2ae72ffa3952": {
       "text": "They can have outside vendors that do fresh",
-      "eligible": true,
+      "eligible": false,
       "unanimous": true,
       "criteria": {
         "makes_proposal": {
@@ -3513,7 +3514,8 @@
             "pass": true
           }
         }
-      ]
+      ],
+      "excluded_by_hand": "'They' cannot be resolved; excluded for consistency with 'Give them the lots to grow'."
     },
     "c6b824c4-d885-4c09-b41d-c9022f47251a": {
       "text": "The new stores should have sales or coupons on certain days or times if great to encourage shopping.  If we really want to be generous, we could have a community store that charges by the bag of food.  For example, you pay $(X) per bag of food. Also, we need pet food availability.",
