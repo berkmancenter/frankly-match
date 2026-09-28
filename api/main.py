@@ -105,10 +105,12 @@ class ParticipantData(BaseModel):
     name: Optional[str] = None
     model_config = {"extra": "allow"}
 
-    @field_validator("email", "name")
+    @field_validator("email", "name", mode="before")
     @classmethod
-    def blank_identity_is_absent(cls, v: Optional[str]) -> Optional[str]:
-        return (v.strip() or None) if v is not None else None
+    def blank_identity_is_absent(cls, v: object) -> Optional[str]:
+        # Anything but a non-blank string (null, a number, an object) counts
+        # as absent rather than failing validation for the whole request.
+        return (v.strip() or None) if isinstance(v, str) else None
 
 
 class MatchRequest(BaseModel):

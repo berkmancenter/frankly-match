@@ -245,7 +245,7 @@ class MatchApiTests(unittest.TestCase):
                     "participants": {
                         "a": {"email": "  Alice@Example.org ", "name": " Alice "},
                         "b": {"email": "not-an-email", "name": "   "},
-                        "c": {},
+                        "c": {"email": 123, "name": {"first": "x"}},
                     },
                 },
             )
@@ -263,6 +263,7 @@ class MatchApiTests(unittest.TestCase):
         self.assertEqual(by_id["b"]["email"], "not-an-email")
         self.assertIsNone(by_id["b"]["name"])
         self.assertIsNone(by_id["c"]["email"])
+        self.assertIsNone(by_id["c"]["name"])
 
     def test_text_diagnostics_go_to_the_logger(self):
         service = FakeTextMatchingService()
