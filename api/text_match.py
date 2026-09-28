@@ -15,6 +15,15 @@ from logger import log
 import numpy as np
 
 from embedding_client import EmbeddingServiceError, HuggingFaceEmbeddingClient
+from presurvey import (
+    DIFFUSION_TOPIC_ID,
+    ApprovalMatrix,
+    CommentCatalog,
+    Link,
+    link_participants,
+    load_approval_matrix,
+    load_comment_catalog,
+)
 
 DiversityLevel = Literal["high", "medium", "low", "unknown"]
 # Question id for a participant who sent one freeTextResponse rather than a
@@ -139,6 +148,16 @@ DIFFUSION_STATEMENTS = (
 class EmbeddingClient(Protocol):
     def embed(self, sentences: Sequence[str]) -> np.ndarray:
         ...
+
+
+@dataclass(frozen=True)
+class PreSurveyContext:
+    """What the pre-survey contributes to one run. Any part may be missing: a
+    failure here is logged and costs statement quality, never a table."""
+
+    catalog: CommentCatalog | None
+    matrix: ApprovalMatrix | None
+    links: dict[str, Link]
 
 
 @dataclass(frozen=True)
@@ -859,10 +878,12 @@ class TextMatchingService:
         embedding_client: EmbeddingClient | None = None,
         diffusion_statements: Sequence[str] = DIFFUSION_STATEMENTS,
         optimization_seconds: float = 30.0,
+        approval_matrix_uri: str | None = None,
     ):
         self.embedding_client = embedding_client or HuggingFaceEmbeddingClient()
         self.diffusion_statements = tuple(diffusion_statements)
         self.optimization_seconds = optimization_seconds
+        self.approval_matrix_uri = approval_matrix_uri
         self._diffusion_embeddings: np.ndarray | None = None
         self._diffusion_lock = threading.Lock()
 
@@ -873,16 +894,21 @@ class TextMatchingService:
             optimization_seconds = min(240.0, max(0.0, float(raw_seconds)))
         except ValueError:
             optimization_seconds = 30.0
-        return cls(optimization_seconds=optimization_seconds)
+        return cls(
+            optimization_seconds=optimization_seconds,
+            approval_matrix_uri=_provenance("APPROVAL_MATRIX_URI"),
+        )
 
     def match(
         self,
         participant_responses: dict[str, str | dict[str, str]],
         target_group_size: int,
         request=None,
+        identities: dict[str, tuple[str | None, str | None]] | None = None,
     ) -> list[TextMatchGroup]:
         """participant_responses maps each id to {question_id: answer}. A bare
-        string is one answer to SINGLE_RESPONSE_QUESTION_ID."""
+        string is one answer to SINGLE_RESPONSE_QUESTION_ID. identities maps
+        each id to (email, name) for linking to the pre-survey."""
         participant_ids = list(participant_responses)
         answers = {
             pid: (
@@ -1010,6 +1036,9 @@ class TextMatchingService:
         )
         _log_event_design(design, request)
 
+        # Groups are final from here on. Nothing below may change or fail them.
+        self._load_presurvey(identities or {}, request)
+
         # Every answer a table member gave is a row, so the pick is the statement
         # furthest from everything anyone at the table wrote.
         # TODO: Restrict to answers on the diffusion statement's topic.
@@ -1049,6 +1078,93 @@ class TextMatchingService:
                 self._build_group(arm, group, achieved, statement, False)
             )
         return results
+
+    def _load_presurvey(
+        self,
+        identities: dict[str, tuple[str | None, str | None]],
+        request=None,
+    ) -> PreSurveyContext:
+        try:
+            catalog = load_comment_catalog()
+        except Exception as exc:
+            # The catalog ships with the code, so this is a broken deployment.
+            log.log_event(
+                "ERROR", f"Pre-survey comment catalog failed to load: {exc}", request,
+            )
+            return PreSurveyContext(catalog=None, matrix=None, links={})
+
+        matrix = None
+        matrix_error = None
+        if not self.approval_matrix_uri:
+            matrix_error = "APPROVAL_MATRIX_URI is not set"
+        else:
+            try:
+                matrix = load_approval_matrix(self.approval_matrix_uri, catalog)
+            except Exception as exc:
+                matrix_error = f"{type(exc).__name__}: {exc}"
+
+        log.log_event("INFO", "Pre-survey data", request, extra_data={
+            "diffusion_topic_id": DIFFUSION_TOPIC_ID,
+            "catalog_sha256": catalog.sha256,
+            "catalog_comment_count": len(catalog.comments),
+            "catalog_topic_counts": catalog.topic_counts(),
+            "catalog_embedding_model": catalog.embedding_model,
+            "catalog_embedding_revision": catalog.embedding_revision,
+            "matrix_source": self.approval_matrix_uri,
+            "matrix_loaded": matrix is not None,
+            "matrix_error": matrix_error,
+            "matrix_sha256": matrix.sha256 if matrix else None,
+            "matrix_voter_count": len(matrix.pids) if matrix else None,
+            "matrix_observed_share": matrix.observed_share if matrix else None,
+        })
+        # Catalog embeddings are only comparable with registration embeddings
+        # from the same model. Checked only where the deployment records one.
+        for field, deployed in (
+            ("model", _provenance("HF_MODEL_ID")),
+            ("revision", _provenance("HF_MODEL_REVISION")),
+        ):
+            recorded = getattr(catalog, f"embedding_{field}")
+            if deployed and recorded and deployed != recorded:
+                log.log_event(
+                    "WARNING",
+                    f"Catalog embedding {field} '{recorded}' differs from the "
+                    f"deployed '{deployed}'; comment distances are not comparable",
+                    request,
+                )
+        if matrix is None:
+            log.log_event(
+                "WARNING",
+                f"Approval matrix unavailable; nobody can be linked: {matrix_error}",
+                request,
+            )
+            return PreSurveyContext(catalog=catalog, matrix=None, links={})
+
+        links = link_participants(identities, matrix)
+        counts = {"email": 0, "name": 0, "none": 0}
+        rows: dict[str, list[str]] = {}
+        for link in links.values():
+            counts[link.method] += 1
+            if link.presurvey_pid:
+                rows.setdefault(link.presurvey_pid, []).append(link.participant_id)
+        log.log_event("INFO", "Pre-survey linking", request, extra_data={
+            "link_counts": counts,
+            "links": [
+                {
+                    "participant_id": pid,
+                    "email": identities[pid][0],
+                    "name": identities[pid][1],
+                    "link_method": link.method,
+                    "presurvey_pid": link.presurvey_pid,
+                }
+                for pid, link in links.items()
+            ],
+            # One pre-survey row claimed by several registrants, e.g. a shared
+            # household email. Kept, but visible.
+            "shared_presurvey_rows": {
+                pid: ids for pid, ids in rows.items() if len(ids) > 1
+            },
+        })
+        return PreSurveyContext(catalog=catalog, matrix=matrix, links=links)
 
     @staticmethod
     def _build_group(

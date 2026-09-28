@@ -437,6 +437,9 @@ def match(req: MatchRequest, request: Request):
         participant_responses,
         req.targetGroupSize,
         request,
+        identities={
+            pid: (data.email, data.name) for pid, data in req.participants.items()
+        },
     )
 
     size_report = _group_size_report(

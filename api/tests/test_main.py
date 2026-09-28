@@ -12,8 +12,9 @@ class FakeTextMatchingService:
         self.participant_responses = None
         self.target_group_size = None
 
-    def match(self, participant_responses, target_group_size, request=None):
+    def match(self, participant_responses, target_group_size, request=None, identities=None):
         self.request = request
+        self.identities = identities
         self.participant_responses = participant_responses
         self.target_group_size = target_group_size
         return [
