@@ -443,7 +443,7 @@ def match(req: MatchRequest, request: Request):
                     "fallbackUsed": group.fallback_used,
                     "fallbackReason": (
                         "participant_embedding_failed" if group.diversity_level == "unknown"
-                        else "diffusion_pick_failed" if group.fallback_used else None
+                        else "diffusion_fallback_used" if group.fallback_used else None
                     ),
                 }
                 for index, group in enumerate(groups)

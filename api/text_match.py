@@ -6,13 +6,14 @@ import os
 import random
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from itertools import combinations
 from typing import Literal, Protocol
 
 from logger import log
 import numpy as np
 
+from bridging import pairwise_disagreement_scores
 from embedding_client import EmbeddingServiceError, HuggingFaceEmbeddingClient
 from presurvey import (
     DIFFUSION_TOPIC_ID,
@@ -21,6 +22,7 @@ from presurvey import (
     Link,
     link_participants,
     load_approval_matrix,
+    load_bridging_ranking,
     load_comment_catalog,
     load_eligible_comment_ids,
 )
@@ -135,6 +137,9 @@ class PreSurveyContext:
     links: dict[str, Link]
     # Catalog rows of the diffusion topic's screened-eligible comments.
     candidate_rows: tuple[int, ...] = ()
+    # The same comments ranked by bridging over the whole pre-survey: the
+    # fallback for any statement a table cannot compute.
+    fallback_rows: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -782,50 +787,130 @@ def maximin_scores(
 
 
 @dataclass(frozen=True)
-class DiffusionPick:
-    comment_id: str
+class DiffusionChoice:
+    """One of a table's two statements. fallback_reason is set when the
+    method could not run and the comment came from the global ranking."""
+
+    method: Literal["maximin", "bridging"]
+    comment_id: str | None
     text: str
-    score: float
-    runner_up_id: str | None
-    runner_up_score: float | None
-    own_comments_skipped: int
+    score: float | None = None
+    runner_up_id: str | None = None
+    runner_up_score: float | None = None
+    fallback_reason: str | None = None
+    population_size: int | None = None
+    observed_share: float | None = None
 
 
-def pick_diffusion_comment(
-    member_embeddings: np.ndarray,
+def _clean(text: str) -> str:
+    """Collapse line breaks so a comment cannot break the A/B layout."""
+    return " ".join(text.split())
+
+
+def format_statements(first: str, second: str) -> str:
+    return f"Statement A: {first}\n\nStatement B: {second}"
+
+
+def _ranked(rows: Sequence[int], scores: np.ndarray, exclude_id: str | None, catalog):
+    """(row, score) best first, skipping the comment the other slot holds."""
+    order = np.argsort(-np.asarray(scores), kind="stable")
+    return [
+        (rows[k], float(scores[k])) for k in order
+        if catalog.comments[rows[k]].comment_id != exclude_id
+    ]
+
+
+def _choice(method, ranked, catalog, **extra) -> DiffusionChoice:
+    best, score = ranked[0]
+    runner_up = ranked[1] if len(ranked) > 1 else None
+    return DiffusionChoice(
+        method=method,
+        comment_id=catalog.comments[best].comment_id,
+        text=_clean(catalog.comments[best].text),
+        score=score,
+        runner_up_id=catalog.comments[runner_up[0]].comment_id if runner_up else None,
+        runner_up_score=runner_up[1] if runner_up else None,
+        **extra,
+    )
+
+
+def choose_table_statements(
     context: PreSurveyContext,
     member_ids: Sequence[str],
-) -> DiffusionPick | None:
-    """Maximin pick among eligible comments not written by anyone at the table.
+    member_embeddings: np.ndarray | None,
+) -> tuple[DiffusionChoice, DiffusionChoice]:
+    """The table's maximin and bridging comments, never the same one.
 
-    Authorship is known only for members linked to the pre-survey. Returns
-    None when no candidate remains.
+    Candidates are the eligible diffusion-topic comments not written by any
+    member linked to the pre-survey. A method that cannot run takes the best
+    comment from the global bridging ranking that is not the table's own and
+    not already in the other slot.
     """
     catalog = context.catalog
-    authors = {
-        context.links[pid].presurvey_pid
-        for pid in member_ids
-        if pid in context.links and context.links[pid].presurvey_pid
-    }
+    if catalog is None:
+        return tuple(
+            DiffusionChoice(method, None, FALLBACK_STATEMENT, fallback_reason="catalog_unavailable")
+            for method in ("maximin", "bridging")
+        )
+
+    linked = [
+        context.links[pid] for pid in member_ids
+        if pid in context.links and context.links[pid].row is not None
+    ]
+    authors = {link.presurvey_pid for link in linked}
     rows = [
         row for row in context.candidate_rows
         if catalog.comments[row].author_pid not in authors
     ]
-    if not rows:
-        return None
-    scores = maximin_scores(member_embeddings, catalog.embeddings[rows])
-    order = np.argsort(-scores, kind="stable")
-    best = rows[order[0]]
-    runner_up = rows[order[1]] if len(rows) > 1 else None
-    return DiffusionPick(
-        comment_id=catalog.comments[best].comment_id,
-        # Collapse line breaks so the comment cannot break the A/B layout.
-        text=" ".join(catalog.comments[best].text.split()),
-        score=float(scores[order[0]]),
-        runner_up_id=catalog.comments[runner_up].comment_id if runner_up is not None else None,
-        runner_up_score=float(scores[order[1]]) if runner_up is not None else None,
-        own_comments_skipped=len(context.candidate_rows) - len(rows),
-    )
+
+    maximin: DiffusionChoice | str
+    if member_embeddings is None:
+        maximin = "participant_embedding_failed"
+    elif not rows:
+        maximin = "no_candidates_left"
+    else:
+        try:
+            scores = maximin_scores(member_embeddings, catalog.embeddings[rows])
+            maximin = _choice("maximin", _ranked(rows, scores, None, catalog), catalog)
+        except ValueError as exc:
+            maximin = f"pick_failed: {exc}"
+
+    # Duplicate-row links (e.g. a shared email) count once in the population.
+    population = sorted({link.row for link in linked})
+    bridging: DiffusionChoice | str
+    if context.matrix is None:
+        bridging = "matrix_unavailable"
+    elif len(population) < 2:
+        bridging = "fewer_than_two_linked"
+    else:
+        taken = maximin.comment_id if isinstance(maximin, DiffusionChoice) else None
+        probabilities = context.matrix.probabilities[population]
+        ranked = _ranked(
+            rows, pairwise_disagreement_scores(probabilities, rows), taken, catalog
+        ) if rows else []
+        bridging = _choice(
+            "bridging", ranked, catalog,
+            population_size=len(population),
+            observed_share=float(np.mean((probabilities == 0) | (probabilities == 1))),
+        ) if ranked else "no_candidates_left"
+
+    def fallback(method: str, reason: str, other: DiffusionChoice | str) -> DiffusionChoice:
+        taken = other.comment_id if isinstance(other, DiffusionChoice) else None
+        for row in context.fallback_rows:
+            comment = catalog.comments[row]
+            if comment.author_pid not in authors and comment.comment_id != taken:
+                return DiffusionChoice(
+                    method, comment.comment_id, _clean(comment.text), fallback_reason=reason
+                )
+        return DiffusionChoice(
+            method, None, FALLBACK_STATEMENT, fallback_reason=f"{reason}; ranking_exhausted"
+        )
+
+    if isinstance(maximin, str):
+        maximin = fallback("maximin", maximin, bridging)
+    if isinstance(bridging, str):
+        bridging = fallback("bridging", bridging, maximin)
+    return maximin, bridging
 
 
 def _provenance(name: str) -> str | None:
@@ -901,7 +986,9 @@ class TextMatchingService:
                 request=request,
                 extra_data={"participant_count": len(participant_ids)},
             )
-            return self._fallback_groups(participant_ids, group_sizes, seed)
+            return self._fallback_groups(
+                participant_ids, group_sizes, seed, identities or {}, request
+            )
 
         # Randomisation into condition pools happens here, after embedding, so a
         # REQUIRE_REAL_TEXT failure aborts before anyone is assigned, and before
@@ -952,60 +1039,76 @@ class TextMatchingService:
         _log_event_design(design, request)
 
         # Groups are final from here on. Nothing below may change or fail them.
-        context = self._load_presurvey(identities or {}, request)
-
         embedding_by_id = {
             participant_id: participant_embeddings[index]
             for index, participant_id in enumerate(participant_ids)
         }
+        placed = [
+            (arm, group, achieved)
+            for arm in design.arms
+            for group, achieved in zip(arm.groups, arm.achieved)
+        ]
+        statements = self._diffusion_statements(
+            [group for _, group, _ in placed],
+            [arm.level for arm, _, _ in placed],
+            embedding_by_id, identities or {}, seed, request,
+        )
+        return [
+            self._build_group(arm, group, achieved, statement, fallback_used)
+            for (arm, group, achieved), (statement, fallback_used) in zip(placed, statements)
+        ]
+
+    def _diffusion_statements(
+        self,
+        groups: list[list[str]],
+        levels: list[str],
+        embedding_by_id: dict[str, np.ndarray] | None,
+        identities: dict[str, tuple[str | None, str | None]],
+        seed: int,
+        request=None,
+    ) -> list[tuple[str, bool]]:
+        """Each group's "Statement A / Statement B" text and whether either
+        slot fell back. Which method fills slot A is randomised per group."""
+        context = self._load_presurvey(identities, request)
+        order_rng = random.Random(seed ^ 0xAB0DE)
         results = []
-        picks_log = []
-        for arm in design.arms:
-            for group, achieved in zip(arm.groups, arm.achieved):
-                pick, reason = None, None
-                if context.catalog is None:
-                    reason = "catalog_unavailable"
-                else:
-                    try:
-                        pick = pick_diffusion_comment(
-                            np.vstack([embedding_by_id[pid] for pid in group]),
-                            context,
-                            group,
-                        )
-                        reason = None if pick else "no_candidates_left"
-                    except ValueError as exc:
-                        reason = f"pick_failed: {exc}"
-                results.append(self._build_group(
-                    arm, group, achieved,
-                    pick.text if pick else FALLBACK_STATEMENT,
-                    pick is None,
-                ))
-                picks_log.append({
-                    "participant_ids": group,
-                    "diversity_level": arm.level,
-                    "comment_id": pick.comment_id if pick else None,
-                    "text": pick.text if pick else None,
-                    "min_member_distance": pick.score if pick else None,
-                    "runner_up_id": pick.runner_up_id if pick else None,
-                    "runner_up_min_member_distance": pick.runner_up_score if pick else None,
-                    "own_comments_skipped": pick.own_comments_skipped if pick else None,
-                    "fallback_reason": reason,
-                })
+        records = []
+        for group, level in zip(groups, levels):
+            maximin, bridging = choose_table_statements(
+                context,
+                group,
+                None if embedding_by_id is None
+                else np.vstack([embedding_by_id[pid] for pid in group]),
+            )
+            maximin_first = order_rng.random() < 0.5
+            first, second = (maximin, bridging) if maximin_first else (bridging, maximin)
+            fell_back = bool(maximin.fallback_reason or bridging.fallback_reason)
+            results.append((format_statements(first.text, second.text), fell_back))
+            records.append({
+                "participant_ids": group,
+                "diversity_level": level,
+                "slot_a_method": first.method,
+                "maximin": asdict(maximin),
+                "bridging": asdict(bridging),
+            })
 
         log.log_event("INFO", "Diffusion picks", request, extra_data={
-            "method": "maximin_cosine_distance",
             "candidate_count": len(context.candidate_rows),
-            "fallback_count": sum(1 for p in picks_log if p["fallback_reason"]),
-            "groups": picks_log,
+            "maximin_fallback_count": sum(1 for r in records if r["maximin"]["fallback_reason"]),
+            "bridging_fallback_count": sum(1 for r in records if r["bridging"]["fallback_reason"]),
+            "groups": records,
         })
-        if any(p["fallback_reason"] for p in picks_log):
+        reasons = sorted({
+            record[method]["fallback_reason"]
+            for record in records for method in ("maximin", "bridging")
+            if record[method]["fallback_reason"]
+        })
+        if reasons:
             log.log_event(
                 "WARNING",
-                "Some groups received the fallback diffusion statement",
+                "Some diffusion statements came from the global bridging fallback",
                 request,
-                extra_data={"reasons": sorted({
-                    p["fallback_reason"] for p in picks_log if p["fallback_reason"]
-                })},
+                extra_data={"reasons": reasons},
             )
         return results
 
@@ -1017,6 +1120,7 @@ class TextMatchingService:
         try:
             catalog = load_comment_catalog()
             eligible = load_eligible_comment_ids()
+            ranking = load_bridging_ranking()
         except Exception as exc:
             # The catalog ships with the code, so this is a broken deployment.
             log.log_event(
@@ -1028,6 +1132,8 @@ class TextMatchingService:
             row for row, comment in enumerate(catalog.comments)
             if comment.topic_id == DIFFUSION_TOPIC_ID and comment.comment_id in eligible
         )
+        row_of = {comment.comment_id: row for row, comment in enumerate(catalog.comments)}
+        fallback_rows = tuple(row_of[cid] for cid in ranking if row_of.get(cid) in candidate_rows)
         matrix = None
         matrix_error = None
         if not self.approval_matrix_uri:
@@ -1075,6 +1181,7 @@ class TextMatchingService:
             )
             return PreSurveyContext(
                 catalog=catalog, matrix=None, links={}, candidate_rows=candidate_rows,
+                fallback_rows=fallback_rows,
             )
 
         links = link_participants(identities, matrix)
@@ -1104,6 +1211,7 @@ class TextMatchingService:
         })
         return PreSurveyContext(
             catalog=catalog, matrix=matrix, links=links, candidate_rows=candidate_rows,
+            fallback_rows=fallback_rows,
         )
 
     @staticmethod
@@ -1128,6 +1236,8 @@ class TextMatchingService:
         participant_ids: list[str],
         group_sizes: list[int],
         seed: int,
+        identities: dict[str, tuple[str | None, str | None]],
+        request=None,
     ) -> list[TextMatchGroup]:
         # TODO: Design a more elegant fallback strategy than random assignment.
         # Without embeddings there is no distance matrix, so no target can be
@@ -1135,16 +1245,20 @@ class TextMatchingService:
         shuffled = participant_ids[:]
         random.Random(seed).shuffle(shuffled)
         groups = _allocate_indices(shuffled, group_sizes)
+        # Bridging needs no embeddings, so it can still run; maximin falls back.
+        statements = self._diffusion_statements(
+            groups, ["unknown"] * len(groups), None, identities, seed, request,
+        )
         return [
             TextMatchGroup(
                 participant_ids=group,
                 diversity_level="unknown",
-                diffusion_statement=FALLBACK_STATEMENT,
+                diffusion_statement=statement,
                 fallback_used=True,
                 assigned_target=None,
                 achieved_diversity=None,
             )
-            for group in groups
+            for group, (statement, _) in zip(groups, statements)
         ]
 
 

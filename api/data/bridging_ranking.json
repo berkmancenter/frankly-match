@@ -1,0 +1,240 @@
+{
+  "description": "Eligible diffusion-topic comments ranked by probabilistic pairwise disagreement with every pre-survey voter as the population. Used as the fallback for any statement a table cannot compute.",
+  "voter_count": 184,
+  "matrix_sha256": "2a6afaafcbddea632b45aad7b5b1ac89c31b82b8fae61c76486f9acb4e292cbd",
+  "catalog_sha256": "13b10b6a23ed7cb906bc3528b346d317f7f41ac1256166c74d6ed165bd70de5b",
+  "ranking": [
+    {
+      "comment_id": "6e1bf115-2dd5-46fa-97d7-ffa461688ee6",
+      "score": 0.24136827218260676
+    },
+    {
+      "comment_id": "656e8cdf-fdad-4115-9af9-382016dd6568",
+      "score": 0.23995614650500086
+    },
+    {
+      "comment_id": "9ef2f6c8-75be-41b7-9b6e-e7762c355a74",
+      "score": 0.23930877733231803
+    },
+    {
+      "comment_id": "b765d7d6-2054-49a9-bf57-47d911f178ba",
+      "score": 0.2375978987965917
+    },
+    {
+      "comment_id": "cbbb1349-8bd2-4cd5-a586-cd2f517a6103",
+      "score": 0.23473920899037207
+    },
+    {
+      "comment_id": "9d541bc7-b4de-478b-9ed1-9645caa8775e",
+      "score": 0.23366273489828798
+    },
+    {
+      "comment_id": "5f3828cb-bc2f-4e59-ba1a-80d01c2ecd8e",
+      "score": 0.23360343560863142
+    },
+    {
+      "comment_id": "a2ae160e-b7e8-4a54-8221-cfdec9bbb72d",
+      "score": 0.23230931957501377
+    },
+    {
+      "comment_id": "3c9dae42-fe9d-4bba-916f-d68e77868236",
+      "score": 0.23224637711403634
+    },
+    {
+      "comment_id": "a81f9d34-f59b-43e5-8d89-88ade56a4efa",
+      "score": 0.2321751996546538
+    },
+    {
+      "comment_id": "f149a135-59db-4f2b-b74b-95a18371733a",
+      "score": 0.23166395049718466
+    },
+    {
+      "comment_id": "eb2ccf94-a35c-4778-8fb3-baaa3849cf9b",
+      "score": 0.2313645591298817
+    },
+    {
+      "comment_id": "3acbac50-33e1-4cd6-997d-15d551acc0ae",
+      "score": 0.23038253515904333
+    },
+    {
+      "comment_id": "76713328-ecda-4790-bd58-0cbae419182a",
+      "score": 0.23033810914236538
+    },
+    {
+      "comment_id": "62bae0d7-1b34-439a-a631-d772ff47b95c",
+      "score": 0.22901844573639674
+    },
+    {
+      "comment_id": "b73113bf-755d-4e32-9dc8-6a07bbf6aee3",
+      "score": 0.22880416456320088
+    },
+    {
+      "comment_id": "e195acc9-17ba-4aee-8832-d536cf36e4c9",
+      "score": 0.22776160190785782
+    },
+    {
+      "comment_id": "22959fb4-438a-4674-b560-07cb1ed08a1d",
+      "score": 0.22766010176360849
+    },
+    {
+      "comment_id": "7c473208-31bb-4f8c-81c5-8fcb6d9b4c33",
+      "score": 0.2264415696456553
+    },
+    {
+      "comment_id": "6d031da2-6f6d-4f13-aaae-8b0f6992c24e",
+      "score": 0.22634837372155744
+    },
+    {
+      "comment_id": "3d61afbb-0def-451a-ac97-6e98b17deb8c",
+      "score": 0.22628394642633748
+    },
+    {
+      "comment_id": "d88fb5a5-9d27-4097-b369-ef767ab46d03",
+      "score": 0.2258169030184511
+    },
+    {
+      "comment_id": "a701fcd9-9c47-445f-8f4b-793b0dac6bed",
+      "score": 0.2254857244124132
+    },
+    {
+      "comment_id": "21a942a9-79c0-4ead-aebe-2a31e92a2a99",
+      "score": 0.2251765596653874
+    },
+    {
+      "comment_id": "f7a573e1-4e54-40df-9feb-c1d084100807",
+      "score": 0.2233512302950562
+    },
+    {
+      "comment_id": "3739a923-0528-42bd-80ee-4a87e1f6a5e6",
+      "score": 0.22309751600019442
+    },
+    {
+      "comment_id": "5626af6d-1c56-41f8-aac8-6acfc397a1c7",
+      "score": 0.22305019182338076
+    },
+    {
+      "comment_id": "b4e66d90-d8e2-4f36-9356-b678498e131c",
+      "score": 0.22294066624910272
+    },
+    {
+      "comment_id": "ae4b9110-6724-4fa2-8000-275bde343a90",
+      "score": 0.22259795144900396
+    },
+    {
+      "comment_id": "d0199413-3804-43c1-9cd0-bc255e24792b",
+      "score": 0.2225081782673066
+    },
+    {
+      "comment_id": "0e745a62-891a-4eb7-80a4-9e15d9b75506",
+      "score": 0.22234150998543067
+    },
+    {
+      "comment_id": "46513882-73ad-42a4-bf89-1e0390c89ef5",
+      "score": 0.2223236573209792
+    },
+    {
+      "comment_id": "91d51348-1ec1-44ac-8d90-0a761a84ee19",
+      "score": 0.22117583159990326
+    },
+    {
+      "comment_id": "515d8702-9679-458e-a95e-41ff974ad5c8",
+      "score": 0.22043304939812175
+    },
+    {
+      "comment_id": "1313f667-a58a-454e-ba92-3db1bbaf9754",
+      "score": 0.21890314835056085
+    },
+    {
+      "comment_id": "7ce38ad5-51ee-4184-995c-1e46b4950b51",
+      "score": 0.21764202226928547
+    },
+    {
+      "comment_id": "acdd5217-2657-4b98-8916-6444f5768101",
+      "score": 0.21751293637771676
+    },
+    {
+      "comment_id": "175900c9-e393-41e4-b768-3216236378c7",
+      "score": 0.21729926401552335
+    },
+    {
+      "comment_id": "b8aead76-b773-42c9-981b-af59fde5035a",
+      "score": 0.2149267047285026
+    },
+    {
+      "comment_id": "05821668-7973-4858-8b57-66751efa1970",
+      "score": 0.2146399255448971
+    },
+    {
+      "comment_id": "a6193ed5-752c-4b9c-ad57-ed62c7c43a47",
+      "score": 0.21405312202426346
+    },
+    {
+      "comment_id": "94ec8ef2-e97a-4a70-a736-aba4c4650ae3",
+      "score": 0.21014031562472035
+    },
+    {
+      "comment_id": "c6a73415-fc6b-4736-83d4-79178eca23f9",
+      "score": 0.20918484587866004
+    },
+    {
+      "comment_id": "9dbc7343-a3b9-467e-9e33-84dfac8c5e80",
+      "score": 0.2061113256993399
+    },
+    {
+      "comment_id": "d568283b-9876-4876-86d3-cf9d36d853fa",
+      "score": 0.20311762708618142
+    },
+    {
+      "comment_id": "2004dd9e-7759-4184-bfd0-2f0167e5ee29",
+      "score": 0.20086853593231063
+    },
+    {
+      "comment_id": "c906006e-185b-48d6-bcd4-86ca5d9989ff",
+      "score": 0.19988009884305796
+    },
+    {
+      "comment_id": "320ddb27-f802-46e1-9672-18049633fe36",
+      "score": 0.19604384345249803
+    },
+    {
+      "comment_id": "5087b766-6cf4-439a-bb0c-9ce7d8da6f32",
+      "score": 0.19586045239824346
+    },
+    {
+      "comment_id": "f9b58b8a-9bfc-4b33-b698-6bc0c721d606",
+      "score": 0.18436061249159152
+    },
+    {
+      "comment_id": "3935d22f-25e4-4457-aa10-6bdc2c23bd09",
+      "score": 0.18184942725807948
+    },
+    {
+      "comment_id": "6b477f5e-8187-4247-b21c-e94e7280b898",
+      "score": 0.18069776366887555
+    },
+    {
+      "comment_id": "e3f7879b-67a6-4148-83b1-8bcc7abd1dff",
+      "score": 0.18019323880516902
+    },
+    {
+      "comment_id": "776446f6-da6c-462a-a0d3-d5f1849e382e",
+      "score": 0.1739759742594695
+    },
+    {
+      "comment_id": "e44225fa-c6e1-4cd6-80b1-58b7f88d1bdb",
+      "score": 0.17221210102164397
+    },
+    {
+      "comment_id": "cc8fda0d-a082-42fc-b997-1bf870a8f884",
+      "score": 0.16725052603474358
+    },
+    {
+      "comment_id": "ea9c814d-c1a6-4b4b-aea7-8ea9901fc4e0",
+      "score": 0.14706194625922425
+    },
+    {
+      "comment_id": "8218b382-bed9-4944-a01a-fc22aa49b512",
+      "score": 0.14678091848251482
+    }
+  ]
+}

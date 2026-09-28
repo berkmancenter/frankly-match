@@ -36,6 +36,10 @@ CATALOG_PATH = Path(__file__).resolve().parent / "data" / "presurvey_comments.js
 # Offline LLM screen of the diffusion topic's comments; see
 # scripts/judge_diffusion_comments.py. Only comments marked eligible are shown.
 ELIGIBILITY_PATH = Path(__file__).resolve().parent / "data" / "diffusion_eligibility.json"
+# Eligible comments ranked by bridging over all pre-survey voters; see
+# scripts/rank_global_bridging.py. The fallback for any statement a table
+# cannot compute.
+BRIDGING_RANKING_PATH = Path(__file__).resolve().parent / "data" / "bridging_ranking.json"
 CATALOG_SCHEMA_VERSION = 1
 MATRIX_IDENTITY_COLUMNS = ("email", "name", "pid")
 UNIT_NORM_TOLERANCE = 1e-3
@@ -174,6 +178,12 @@ def load_eligible_comment_ids() -> frozenset[str]:
         for comment_id, entry in document["comments"].items()
         if entry["eligible"]
     )
+
+
+@lru_cache(maxsize=1)
+def load_bridging_ranking() -> tuple[str, ...]:
+    document = json.loads(BRIDGING_RANKING_PATH.read_bytes())
+    return tuple(entry["comment_id"] for entry in document["ranking"])
 
 
 def parse_approval_matrix(

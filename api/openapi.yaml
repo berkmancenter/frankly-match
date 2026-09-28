@@ -83,7 +83,7 @@ paths:
 
         The response carries only what a client renders: groupId, participantIds, diversityLevel and diffusionStatement. Every diagnostic is logged rather than returned - assignedTarget, achievedDiversity, pool geometry, feasible bounds per arm, achieved endpoint means, the medium target, arm-overlap gaps, per-arm restart convergence, and the embedded text per participant.
 
-        diversityLevel reports which arm a group was randomized into and is the regressor for analysis. If embedding fails, the API returns size-preserving random groups with diversityLevel "unknown" and the fallback diffusion statement; the failure is logged as a WARNING.
+        diversityLevel reports which arm a group was randomized into and is the regressor for analysis. If embedding fails, the API returns size-preserving random groups with diversityLevel "unknown"; their diffusion statements come from the global bridging fallback, and the failure is logged as a WARNING.
 
         With REQUIRE_REAL_TEXT set, a participant missing freeTextResponse causes a 422 MISSING_TEXT_RESPONSES listing the affected ids, rather than silent placeholder substitution.
 
@@ -112,11 +112,11 @@ paths:
                 - groupId: "1"
                   participantIds: ["uid_alice", "uid_dave", "uid_eve"]
                   diversityLevel: high
-                  diffusionStatement: "Political compromise is usually more valuable than ideological consistency."
+                  diffusionStatement: "Statement A: More farmer market locations.\n\nStatement B: Pay people to grow their own food"
                 - groupId: "2"
                   participantIds: ["uid_bob", "uid_carol", "uid_frank"]
                   diversityLevel: medium
-                  diffusionStatement: "Future generations should have formal representation in present-day decisions."
+                  diffusionStatement: "Statement A: Hydrogrowing and wall growing options\n\nStatement B: Open grocery stores in food desert neighborhoods."
         "400":
           $ref: "#/responses/BadRequest"
         "422":
@@ -248,7 +248,7 @@ definitions:
       diffusionStatement:
         type: string
         description: |
-          Statement selected to be distant from every group member using a maximin cosine-distance rule. FALLBACK STATEMENT is returned when statement selection is unavailable.
+          Two pre-survey comments on the diffusion topic, formatted as "Statement A: <comment>\n\nStatement B: <comment>". One is the comment furthest (by cosine distance) from the group's nearest member; the other is the comment the group's linked pre-survey voters find most bridging. Which fills slot A is randomized per group. A statement that cannot be computed is taken from a precomputed global bridging ranking.
     additionalProperties: true
 
   HealthResponse:

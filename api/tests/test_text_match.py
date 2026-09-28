@@ -23,9 +23,10 @@ from text_match import (
     pool_mean_distance,
     PreSurveyContext,
     maximin_scores,
-    pick_diffusion_comment,
+    choose_table_statements,
+    format_statements,
 )
-from presurvey import Link, parse_comment_catalog
+from presurvey import ApprovalMatrix, Link, parse_comment_catalog
 
 
 def _catalog(entries):
@@ -50,6 +51,29 @@ STUB_CATALOG = _catalog([
     ("other_topic", "food_access", "pid_y", "other topic", [-1.0, 0.0]),
 ])
 STUB_ELIGIBLE = frozenset({"near", "side", "far", "other_topic"})
+STUB_RANKING = ("side", "near", "far")
+# Columns in catalog order: near, side, far, screened_out, other_topic.
+# Voters a and b disagree on everything except that both approve "side".
+STUB_MATRIX = ApprovalMatrix(
+    pids=("v_a", "v_b", "pid_far"),
+    emails=("a", "b", "c"),
+    names=("A", "B", "C"),
+    probabilities=np.asarray([
+        [1.0, 1.0, 0.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0, 1.0],
+        [1.0, 1.0, 1.0, 1.0, 1.0],
+    ]),
+    source="stub",
+    sha256="stub",
+)
+LINKED_AB = {"a": Link("a", "email", 0, "v_a"), "b": Link("b", "email", 1, "v_b")}
+
+
+def _context(links=None, matrix=STUB_MATRIX, catalog=STUB_CATALOG):
+    return PreSurveyContext(
+        catalog=catalog, matrix=matrix, links=links if links is not None else LINKED_AB,
+        candidate_rows=(0, 1, 2), fallback_rows=(1, 0, 2),
+    )
 
 
 class QueueEmbeddingClient:
@@ -166,32 +190,81 @@ class DiversityTargetTests(unittest.TestCase):
 
 
 
-class DiffusionPickTests(unittest.TestCase):
-    CONTEXT = PreSurveyContext(
-        catalog=STUB_CATALOG, matrix=None, links={}, candidate_rows=(0, 1, 2),
-    )
+class TableStatementTests(unittest.TestCase):
+    MEMBERS = ["a", "b"]
+    NEAR_1_0 = np.asarray([[1.0, 0.0], [1.0, 0.0]])
 
-    def test_own_comments_are_skipped_for_linked_members(self):
-        links = {"p1": Link("p1", "email", 2, "pid_far")}
-        context = PreSurveyContext(
-            catalog=STUB_CATALOG, matrix=None, links=links, candidate_rows=(0, 1, 2),
+    def test_both_methods_run_and_pick_different_comments(self):
+        maximin, bridging = choose_table_statements(_context(), self.MEMBERS, self.NEAR_1_0)
+        # Members sit at [1, 0]: "far" is furthest from them.
+        self.assertEqual((maximin.comment_id, maximin.fallback_reason), ("far", None))
+        # a and b disagree on 3 of the 4 other comments and both approve
+        # "side": 2 ordered pairs * 3 / (n^2 = 4 * m = 5).
+        self.assertEqual((bridging.comment_id, bridging.fallback_reason), ("side", None))
+        self.assertAlmostEqual(bridging.score, 0.3)
+        self.assertEqual(bridging.population_size, 2)
+        self.assertEqual(bridging.observed_share, 1.0)
+
+    def test_bridging_takes_its_runner_up_when_maximin_has_its_pick(self):
+        # Members at [0, -1] put "side" furthest away, so maximin takes it.
+        maximin, bridging = choose_table_statements(
+            _context(), self.MEMBERS, np.asarray([[0.0, -1.0]] * 2)
         )
-        pick = pick_diffusion_comment(np.asarray([[1.0, 0.0]]), context, ["p1"])
-        # "far" is the maximin pick but p1 wrote it.
-        self.assertEqual(pick.comment_id, "side")
-        self.assertEqual(pick.own_comments_skipped, 1)
+        self.assertEqual(maximin.comment_id, "side")
+        self.assertEqual(bridging.comment_id, "near")
+        self.assertIsNone(bridging.fallback_reason)
 
-    def test_picked_text_has_whitespace_collapsed(self):
-        pick = pick_diffusion_comment(np.asarray([[0.0, -1.0]]), self.CONTEXT, ["p"])
-        self.assertEqual(pick.comment_id, "side")
-        self.assertEqual(pick.text, "side comment")
-
-    def test_no_candidates_left_returns_none(self):
-        context = PreSurveyContext(
-            catalog=STUB_CATALOG, matrix=None, candidate_rows=(2,),
-            links={"p": Link("p", "email", 0, "pid_far")},
+    def test_own_comments_are_skipped(self):
+        links = {**LINKED_AB, "c": Link("c", "email", 2, "pid_far")}
+        maximin, _ = choose_table_statements(
+            _context(links), ["a", "b", "c"], np.asarray([[1.0, 0.0]] * 3)
         )
-        self.assertIsNone(pick_diffusion_comment(np.asarray([[1.0, 0.0]]), context, ["p"]))
+        # "far" would win, but c wrote it.
+        self.assertEqual(maximin.comment_id, "side")
+
+    def test_text_has_whitespace_collapsed(self):
+        maximin, _ = choose_table_statements(
+            _context(), self.MEMBERS, np.asarray([[0.0, -1.0]] * 2)
+        )
+        self.assertEqual(maximin.text, "side comment")
+
+    def test_bridging_falls_back_to_the_global_ranking(self):
+        for context, members, reason in (
+            (_context(matrix=None), self.MEMBERS, "matrix_unavailable"),
+            (_context(links={"a": LINKED_AB["a"]}), self.MEMBERS, "fewer_than_two_linked"),
+            # Two registrants on one pre-survey row are one voter.
+            (_context(links={"a": LINKED_AB["a"], "b": Link("b", "name", 0, "v_a")}),
+             self.MEMBERS, "fewer_than_two_linked"),
+        ):
+            with self.subTest(reason=reason):
+                maximin, bridging = choose_table_statements(context, members, self.NEAR_1_0)
+                self.assertEqual(bridging.fallback_reason, reason)
+                # Top of the global ranking, which maximin ("far") does not hold.
+                self.assertEqual(bridging.comment_id, "side")
+                self.assertIsNone(bridging.score)
+
+    def test_the_fallback_never_duplicates_the_other_slot(self):
+        maximin, bridging = choose_table_statements(
+            _context(matrix=None), self.MEMBERS, np.asarray([[0.0, -1.0]] * 2)
+        )
+        self.assertEqual(maximin.comment_id, "side")
+        self.assertEqual(bridging.comment_id, "near")
+
+    def test_maximin_falls_back_without_embeddings_while_bridging_still_runs(self):
+        maximin, bridging = choose_table_statements(_context(), self.MEMBERS, None)
+        self.assertEqual(bridging.comment_id, "side")
+        self.assertEqual(maximin.fallback_reason, "participant_embedding_failed")
+        self.assertEqual(maximin.comment_id, "near")
+
+    def test_no_catalog_means_the_fallback_text(self):
+        maximin, bridging = choose_table_statements(
+            _context(catalog=None), self.MEMBERS, self.NEAR_1_0
+        )
+        self.assertEqual(maximin.text, FALLBACK_STATEMENT)
+        self.assertEqual(bridging.fallback_reason, "catalog_unavailable")
+
+    def test_format(self):
+        self.assertEqual(format_statements("x", "y"), "Statement A: x\n\nStatement B: y")
 
 
 class EventDesignTests(unittest.TestCase):
@@ -436,27 +509,37 @@ class TextMatchingServiceTests(unittest.TestCase):
             optimization_seconds=0,
         )
 
-    def test_each_group_gets_an_eligible_diffusion_topic_comment(self):
-        service = self._stub_service(np.asarray(
-            [[1.0, 0.0], [0.9, 0.1], [0.8, 0.2], [1.0, 0.1], [0.7, 0.3], [0.95, 0.05]]
-        ))
-        with patch("text_match.load_comment_catalog", return_value=STUB_CATALOG), \
-                patch("text_match.load_eligible_comment_ids", return_value=STUB_ELIGIBLE), \
-                patch("text_match.log.log_event") as logged:
-            groups = service.match({f"p{i}": f"r{i}" for i in range(6)}, 3)
+    def _stubbed(self):
+        return (
+            patch("text_match.load_comment_catalog", return_value=STUB_CATALOG),
+            patch("text_match.load_eligible_comment_ids", return_value=STUB_ELIGIBLE),
+            patch("text_match.load_bridging_ranking", return_value=STUB_RANKING),
+        )
 
-        self.assertEqual([len(group.participant_ids) for group in groups], [3, 3])
-        # Everyone sits near [1, 0], so the far comment wins. The screened-out
-        # and other-topic comments are just as far but never candidates.
-        self.assertTrue(all(group.diffusion_statement == "far" for group in groups))
-        self.assertTrue(all(not group.fallback_used for group in groups))
+    def test_each_group_gets_two_labelled_statements_in_a_logged_order(self):
+        embeddings = np.asarray([[1.0, 0.0], [0.9, 0.1], [0.8, 0.2]] * 4)
+        service = self._stub_service(embeddings)
+        catalog, eligible, ranking = self._stubbed()
+        with catalog, eligible, ranking, patch("text_match.log.log_event") as logged:
+            groups = service.match({f"p{i}": f"r{i}" for i in range(12)}, 3)
+
         record = next(
             call.kwargs["extra_data"] for call in logged.call_args_list
             if call.args[1] == "Diffusion picks"
         )
         self.assertEqual(record["candidate_count"], 3)
-        self.assertEqual(record["groups"][0]["runner_up_id"], "side")
-        self.assertIsNone(record["groups"][0]["fallback_reason"])
+        for group, logged_group in zip(groups, record["groups"]):
+            # No matrix is configured: maximin runs, bridging falls back.
+            self.assertEqual(logged_group["maximin"]["comment_id"], "far")
+            self.assertEqual(logged_group["bridging"]["fallback_reason"], "matrix_unavailable")
+            first = logged_group[logged_group["slot_a_method"]]["text"]
+            second_method = "bridging" if logged_group["slot_a_method"] == "maximin" else "maximin"
+            self.assertEqual(
+                group.diffusion_statement,
+                format_statements(first, logged_group[second_method]["text"]),
+            )
+        # The order is randomised per group, and reproducible from the seed.
+        self.assertEqual(len({g["slot_a_method"] for g in record["groups"]}), 2)
 
     def test_a_catalog_failure_preserves_optimized_groups(self):
         service = self._stub_service(np.eye(6))
@@ -465,26 +548,23 @@ class TextMatchingServiceTests(unittest.TestCase):
             groups = service.match({f"p{i}": f"r{i}" for i in range(6)}, 3)
 
         self.assertTrue(all(group.fallback_used for group in groups))
-        # Only the pick failed, so the optimized groups and all their
+        # Only the statements failed, so the optimized groups and all their
         # diversity measurements survive.
         self.assertTrue(all(group.diversity_level != "unknown" for group in groups))
         self.assertTrue(all(group.achieved_diversity is not None for group in groups))
-        self.assertTrue(
-            all(group.diffusion_statement == FALLBACK_STATEMENT for group in groups)
-        )
+        self.assertTrue(all(FALLBACK_STATEMENT in group.diffusion_statement for group in groups))
 
     def test_a_dimension_mismatch_falls_back_without_touching_groups(self):
         """Registration embeddings from a different model than the catalog."""
         service = self._stub_service(np.eye(6))
-        with patch("text_match.load_comment_catalog", return_value=STUB_CATALOG), \
-                patch("text_match.load_eligible_comment_ids", return_value=STUB_ELIGIBLE), \
-                patch("text_match.log.log_event") as logged:
+        catalog, eligible, ranking = self._stubbed()
+        with catalog, eligible, ranking, patch("text_match.log.log_event") as logged:
             groups = service.match({f"p{i}": f"r{i}" for i in range(6)}, 3)
 
         self.assertTrue(all(group.fallback_used for group in groups))
         self.assertTrue(all(group.achieved_diversity is not None for group in groups))
         self.assertTrue(any(
-            call.args[0] == "WARNING" and "fallback diffusion" in call.args[1]
+            call.args[0] == "WARNING" and "global bridging fallback" in call.args[1]
             for call in logged.call_args_list
         ))
 
@@ -511,12 +591,10 @@ class TextMatchingServiceTests(unittest.TestCase):
             all(group.achieved_diversity is None for group in groups)
         )
         self.assertTrue(all(group.assigned_target is None for group in groups))
-        self.assertTrue(
-            all(
-                group.diffusion_statement == FALLBACK_STATEMENT
-                for group in groups
-            )
-        )
+        # The committed ranking still supplies real comments for both slots.
+        for group in groups:
+            self.assertTrue(group.diffusion_statement.startswith("Statement A: "))
+            self.assertNotIn(FALLBACK_STATEMENT, group.diffusion_statement)
 
 
 if __name__ == "__main__":

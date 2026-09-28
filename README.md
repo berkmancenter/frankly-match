@@ -52,7 +52,12 @@ which minimax cannot match when every group in the arm must clear the bar
 simultaneously. Restarts converging on the same value is the evidence that an arm
 sits at its pool's real limit rather than being stuck.
 
-Each text-matched group also receives a `diffusionStatement`: a comment from the pre-survey on the diffusion topic (`stocking_growing`), chosen from those an offline LLM screen marked eligible in `api/data/diffusion_eligibility.json` (see `api/scripts/judge_diffusion_comments.py`). Comments written by anyone at the table who links to the pre-survey are skipped. Of the rest, the pick is the comment whose cosine distance to the table's nearest member is largest.
+Each text-matched group also receives a `diffusionStatement`: a comment from the pre-survey on the diffusion topic (`stocking_growing`), chosen from those an offline LLM screen marked eligible in `api/data/diffusion_eligibility.json` (see `api/scripts/judge_diffusion_comments.py`). Comments written by anyone at the table who links to the pre-survey are skipped. The statement has two parts, returned as `Statement A: …` and `Statement B: …` separated by a blank line, with the order randomized per table:
+
+- **Maximin:** of the remaining candidates, the comment whose cosine distance to the table's nearest member is largest.
+- **Bridging:** the candidate with the highest probabilistic pairwise-disagreement score (`api/bridging.py`), with the table's linked pre-survey voters as the population. It needs at least two linked voters, and never repeats the maximin comment.
+
+A part that cannot be computed (no approval matrix, fewer than two linked voters, failed embeddings) takes the best comment from `api/data/bridging_ranking.json`, the same score computed offline over every pre-survey voter (`api/scripts/rank_global_bridging.py`).
 
 ## Text Response Transition
 
@@ -195,7 +200,7 @@ remains. A durable per-run export (for example one GCS object per run ID) is
 the right long-term home for this matrix and is not part of this change.
 
 Group logs distinguish `participant_embedding_failed` from
-`diffusion_pick_failed` in `fallbackReason`; the "Diffusion picks" record gives the specific reason per group. Successful matching has a null
+`diffusion_fallback_used` in `fallbackReason`; the "Diffusion picks" record gives the specific reason for each statement. Successful matching has a null
 reason. On Cloud Logging failure, the same structured payload is serialized as
 JSON in the stderr log message, and the failure diagnostic itself is a
 structured record carrying the same run ID and schema version. Logging remains
