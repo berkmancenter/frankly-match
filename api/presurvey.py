@@ -43,7 +43,13 @@ BRIDGING_RANKING_PATH = Path(__file__).resolve().parent / "data" / "bridging_ran
 CATALOG_SCHEMA_VERSION = 1
 MATRIX_IDENTITY_COLUMNS = ("email", "name", "pid")
 UNIT_NORM_TOLERANCE = 1e-3
-GCS_TIMEOUT_SECONDS = 30.0
+# The matrix is read after groups are final, but the request is still open:
+# a slow read delays the response Frankly is waiting on. The library's own
+# retry would keep retrying transient errors for up to two minutes, so it is
+# off, and a short bounded retry of our own replaces it: at worst about
+# GCS_ATTEMPTS * GCS_TIMEOUT_SECONDS before bridging falls back.
+GCS_TIMEOUT_SECONDS = 10.0
+GCS_ATTEMPTS = 2
 
 LinkMethod = Literal["email", "name", "none"]
 
@@ -279,12 +285,13 @@ def _download_gcs(bucket: str, blob: str) -> bytes:
     # Imported here so tests and local runs never need the package or credentials.
     from google.cloud import storage
 
-    return (
-        storage.Client()
-        .bucket(bucket)
-        .blob(blob)
-        .download_as_bytes(timeout=GCS_TIMEOUT_SECONDS)
-    )
+    target = storage.Client().bucket(bucket).blob(blob)
+    for attempt in range(GCS_ATTEMPTS):
+        try:
+            return target.download_as_bytes(timeout=GCS_TIMEOUT_SECONDS, retry=None)
+        except Exception:
+            if attempt == GCS_ATTEMPTS - 1:
+                raise
 
 
 def load_approval_matrix(uri: str, catalog: CommentCatalog) -> ApprovalMatrix:

@@ -1,9 +1,10 @@
 import hashlib
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 
@@ -164,6 +165,43 @@ class SourceTests(unittest.TestCase):
         download.assert_called_once_with("deliberations-prod", "match-api-artifacts/m.csv")
         with self.assertRaises(PreSurveyDataError):
             read_source("gs://bucket-only")
+
+
+class GcsDownloadTests(unittest.TestCase):
+    """The GCS library is not installed locally, so a stand-in module plays it."""
+
+    def _storage(self, outcomes):
+        calls = []
+
+        class Blob:
+            def download_as_bytes(self, **kwargs):
+                calls.append(kwargs)
+                outcome = outcomes.pop(0)
+                if isinstance(outcome, Exception):
+                    raise outcome
+                return outcome
+
+        client = MagicMock()
+        client.bucket.return_value.blob.return_value = Blob()
+        module = MagicMock()
+        module.Client.return_value = client
+        return module, calls
+
+    def test_the_library_retry_is_off_and_each_attempt_is_bounded(self):
+        module, calls = self._storage([b"data"])
+        with patch.dict(sys.modules, {"google.cloud.storage": module}):
+            self.assertEqual(presurvey._download_gcs("b", "o"), b"data")
+        self.assertEqual(calls, [{"timeout": presurvey.GCS_TIMEOUT_SECONDS, "retry": None}])
+
+    def test_one_transient_failure_is_retried_then_it_gives_up(self):
+        module, calls = self._storage([ConnectionError("reset"), b"data"])
+        with patch.dict(sys.modules, {"google.cloud.storage": module}):
+            self.assertEqual(presurvey._download_gcs("b", "o"), b"data")
+        module, calls = self._storage([TimeoutError("slow")] * presurvey.GCS_ATTEMPTS)
+        with patch.dict(sys.modules, {"google.cloud.storage": module}), \
+                self.assertRaises(TimeoutError):
+            presurvey._download_gcs("b", "o")
+        self.assertEqual(len(calls), presurvey.GCS_ATTEMPTS)
 
 
 class LinkingTests(unittest.TestCase):
