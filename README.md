@@ -61,9 +61,11 @@ A ranking that cannot be computed (no approval matrix, fewer than two linked vot
 
 Comments are then assigned to every table's two slots jointly (`assign_statements`, solved with the Hungarian algorithm in `api/assignment.py`). Tables do not share a comment until there are more slots than candidates, and then as few comments as possible are reused, never twice at one table. Within that, the total rank lost across all slots is minimised, so a table often gets its second or third choice rather than a comment another table needs more. Each slot's log records the rank it received and the top choice it gave up.
 
-## Text Response Transition
+## Participants Without Text
 
-`freeTextResponse` is defined in the API contract but is not yet guaranteed by the upstream survey payload. During this transition, missing text responses receive deterministic development placeholders. The replacement point is marked with a TODO in `api/main.py`.
+A participant whose `freeTextResponse` is missing or only whitespace is still matched, but nothing is invented for them: any stand-in sentence would carry an opinion and a position in embedding space of its own. Instead they are placed at the mean distance between the participants who did write text, to everyone, so they add exactly average diversity wherever they sit and the pool mean is unchanged. They are left out of the maximin pick; a table where nobody wrote text takes that statement from the global bridging fallback (`no_member_text`). With fewer than two usable texts no distances exist and the groups are random. These participants are listed in `missing_text_participant_ids`.
+
+`REQUIRE_REAL_TEXT=1` refuses the whole request instead (422 `MISSING_TEXT_RESPONSES`). Frankly then falls back to its own matching for everyone, so leave it off for live events.
 
 ## Local API
 
@@ -121,8 +123,8 @@ go to Google Cloud Logging instead (see Logging below).
 
 Every `/match` call emits structured entries through `api/logger.py`:
 
-- the embedded text per participant, flagged where a placeholder was
-  substituted.
+- the embedded text per participant, with `has_text` false where none was
+  usable.
 - the resulting groups with assigned target, achieved diversity, diffusion
   statement and fallback flag.
 - a group-size report comparing produced groups against `plan_group_sizes`,

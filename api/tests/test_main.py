@@ -185,8 +185,9 @@ class MatchApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(service.target_group_size, 3)
         self.assertEqual(service.participant_responses["a"], "supplied response")
-        self.assertTrue(service.participant_responses["b"])
-        self.assertTrue(service.participant_responses["c"])
+        # No stand-in text: the service places them at the average distance.
+        self.assertIsNone(service.participant_responses["b"])
+        self.assertIsNone(service.participant_responses["c"])
         self.assertEqual(
             response.json()["results"][0],
             {
@@ -198,9 +199,9 @@ class MatchApiTests(unittest.TestCase):
         )
 
     def test_embedded_text_is_logged_rather_than_returned(self):
-        """Participants who send no text get a placeholder. The caller used to
-        need that echoed back; it now goes to the logger instead, which is the
-        single biggest payload saving on a large event."""
+        """What was embedded goes to the logger rather than back to the
+        caller, the single biggest payload saving on a large event.
+        Participants without usable text are logged as such."""
         service = FakeTextMatchingService()
         with patch.object(
             main, "get_text_matching_service", return_value=service
@@ -227,9 +228,10 @@ class MatchApiTests(unittest.TestCase):
         )
         by_id = {entry["participant_id"]: entry for entry in logged["responses"]}
         self.assertEqual(by_id["a"]["response"], "supplied response")
-        self.assertFalse(by_id["a"]["is_placeholder"])
-        self.assertTrue(by_id["b"]["is_placeholder"])
-        self.assertEqual(logged["placeholder_count"], 2)
+        self.assertTrue(by_id["a"]["has_text"])
+        self.assertFalse(by_id["b"]["has_text"])
+        self.assertIsNone(by_id["b"]["response"])
+        self.assertEqual(logged["missing_text_count"], 2)
 
     def test_identity_is_trimmed_logged_and_never_rejects(self):
         """email/name link people to the pre-survey. A missing, blank or
@@ -386,7 +388,7 @@ class MatchApiTests(unittest.TestCase):
         self.assertEqual(report["missing_participants"], ["d"])
         self.assertEqual(report["duplicated_participants"], ["c"])
 
-    def test_strict_mode_refuses_placeholder_substitution(self):
+    def test_strict_mode_refuses_participants_without_text(self):
         """At a live event, groups built from placeholder text would look
         statistically perfect and mean nothing. REQUIRE_REAL_TEXT turns the
         silent substitution into a listable 422."""
@@ -413,7 +415,7 @@ class MatchApiTests(unittest.TestCase):
         self.assertIn("c", body["message"])
         self.assertIsNone(service.participant_responses)
 
-    def test_strict_mode_off_keeps_placeholder_fallback(self):
+    def test_strict_mode_off_matches_participants_without_text(self):
         service = FakeTextMatchingService()
         with patch.object(
             main, "get_text_matching_service", return_value=service

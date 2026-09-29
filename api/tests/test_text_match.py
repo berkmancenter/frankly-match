@@ -23,6 +23,7 @@ from text_match import (
     plan_group_sizes,
     pool_mean_distance,
     PreSurveyContext,
+    fill_missing_text_distances,
     maximin_scores,
     assign_statements,
     format_statements,
@@ -199,6 +200,71 @@ def _assign(context, tables):
         for slot in table_preferences(context, t, members, embeddings)
     ]
     return assign_statements(context, preferences)
+
+
+class MissingTextTests(unittest.TestCase):
+    def test_no_text_participants_sit_at_the_mean_real_distance(self):
+        real = cosine_distance_matrix(np.asarray([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]]))
+        distances, fill = fill_missing_text_distances(["a", "x", "b", "c", "y"], ["a", "b", "c"], real)
+        known = [real[0, 1], real[0, 2], real[1, 2]]
+        self.assertAlmostEqual(fill, np.mean(known))
+        # x and y are at the fill distance from everyone, each other included.
+        for other in range(5):
+            if other not in (1,):
+                self.assertAlmostEqual(distances[1, other], fill)
+        self.assertAlmostEqual(distances[1, 4], fill)
+        self.assertEqual(distances[1, 1], 0.0)
+        np.testing.assert_allclose(distances[np.ix_([0, 2, 3], [0, 2, 3])], real)
+        # The pool mean, which every target is built on, is unchanged.
+        self.assertAlmostEqual(pool_mean_distance(distances), pool_mean_distance(real))
+
+    def _service(self, embeddings):
+        return TextMatchingService(
+            embedding_client=QueueEmbeddingClient([embeddings]), optimization_seconds=0,
+        )
+
+    def test_only_real_text_is_embedded_and_no_text_is_logged(self):
+        class Recording(QueueEmbeddingClient):
+            def embed(self, sentences):
+                self.sentences = list(sentences)
+                return super().embed(sentences)
+
+        client = Recording([np.random.default_rng(2).normal(size=(5, 2))])
+        service = TextMatchingService(embedding_client=client, optimization_seconds=0)
+        responses = {f"p{i}": f"text {i}" for i in range(5)}
+        responses["q"] = None
+        with patch("text_match.load_comment_catalog", return_value=STUB_CATALOG), \
+                patch("text_match.load_eligible_comment_ids", return_value=STUB_ELIGIBLE), \
+                patch("text_match.load_bridging_ranking", return_value=STUB_RANKING), \
+                patch("text_match.log.log_event") as logged:
+            groups = service.match(responses, 3)
+
+        self.assertEqual(client.sentences, [f"text {i}" for i in range(5)])
+        self.assertEqual(sorted(p for g in groups for p in g.participant_ids), sorted(responses))
+        complete = next(
+            call.kwargs["extra_data"] for call in logged.call_args_list
+            if call.args[1] == "Participant distances complete"
+        )
+        self.assertEqual(complete["missing_text_participant_ids"], ["q"])
+        self.assertIsNotNone(complete["missing_text_fill_distance"])
+
+    def test_a_table_where_nobody_wrote_text_falls_back_for_maximin_only(self):
+        context = _context()
+        maximin, bridging = table_preferences(
+            context, 0, ["a", "b"], None, missing_embeddings_reason="no_member_text",
+        )
+        self.assertEqual(maximin.fallback_reason, "no_member_text")
+        self.assertIsNone(bridging.fallback_reason)
+
+    def test_fewer_than_two_texts_means_random_groups_with_real_statements(self):
+        service = self._service(np.eye(2))
+        responses = {f"p{i}": None for i in range(6)}
+        responses["p0"] = "only one"
+        with patch("text_match.log.log_event") as logged:
+            groups = service.match(responses, 3)
+        self.assertTrue(all(g.diversity_level == "unknown" for g in groups))
+        self.assertTrue(all(FALLBACK_STATEMENT not in g.diffusion_statement for g in groups))
+        self.assertTrue(any("usable text" in call.args[1] for call in logged.call_args_list))
 
 
 class TablePreferenceTests(unittest.TestCase):

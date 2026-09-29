@@ -96,33 +96,6 @@ ENDPOINT_RESTARTS = 10
 DISTANCE_LOG_VALUES_PER_ENTRY = 6144
 DISTANCE_LOG_MAX_PARTICIPANTS = 500
 
-DUMMY_PARTICIPANT_STATEMENTS = (
-    "Public transit should be free in major cities.",
-    "Public transit fares are necessary to maintain reliable service.",
-    "Governments should introduce a universal basic income.",
-    "Employment programs are preferable to a universal basic income.",
-    "Social media platforms should face stricter content regulation.",
-    "People should have broad freedom to speak on social media platforms.",
-    "Cities should build substantially more dense housing.",
-    "Neighborhoods should retain local control over new housing development.",
-    "Carbon taxes are the best way to reduce emissions.",
-    "Climate policy should prioritize direct investment over carbon taxes.",
-    "University tuition should be publicly funded.",
-    "Students should contribute toward the cost of their university education.",
-    "Voting should be mandatory in national elections.",
-    "Voting should remain a voluntary civic choice.",
-    "Governments should place tighter restrictions on artificial intelligence.",
-    "Artificial intelligence should develop with minimal government restriction.",
-    "Healthcare should primarily be delivered through a public system.",
-    "Private healthcare options improve access and innovation.",
-    "Police budgets should shift toward community-based services.",
-    "Police departments need additional resources to improve public safety.",
-    "Immigration policy should make permanent residency easier to obtain.",
-    "Immigration levels should be reduced until infrastructure catches up.",
-    "Workers should have stronger legal protections for collective bargaining.",
-    "Labor policy should give employers greater flexibility in hiring.",
-)
-
 class EmbeddingClient(Protocol):
     def embed(self, sentences: Sequence[str]) -> np.ndarray:
         ...
@@ -170,16 +143,6 @@ class TableStatements:
         return bool(self.maximin_fallback_reason or self.bridging_fallback_reason)
 
 
-
-
-def placeholder_responses(participant_ids: Sequence[str]) -> dict[str, str]:
-    ids = list(participant_ids)
-    pool = [
-        DUMMY_PARTICIPANT_STATEMENTS[index % len(DUMMY_PARTICIPANT_STATEMENTS)]
-        for index in range(len(ids))
-    ]
-    random.Random(_stable_seed(ids)).shuffle(pool)
-    return dict(zip(ids, pool))
 
 
 def plan_group_sizes(
@@ -237,6 +200,29 @@ def cosine_distance_matrix(embeddings: np.ndarray) -> np.ndarray:
     distances = 1.0 - similarities
     np.fill_diagonal(distances, 0.0)
     return distances
+
+
+def fill_missing_text_distances(
+    participant_ids: Sequence[str],
+    text_ids: Sequence[str],
+    text_distances: np.ndarray,
+) -> tuple[np.ndarray, float]:
+    """Everyone's distances, with no-text participants at the mean real distance.
+
+    Someone with no usable text has nothing to compare, and any stand-in
+    sentence has an opinion or a position in embedding space of its own. So
+    they are given the mean distance between the participants who do have
+    text, to everyone: wherever they are placed they add exactly average
+    diversity, and the pool mean, which every target is built on, is
+    unchanged. Returns the matrix and the fill value.
+    """
+    index = {pid: i for i, pid in enumerate(participant_ids)}
+    positions = [index[pid] for pid in text_ids]
+    fill = pool_mean_distance(text_distances)
+    distances = np.full((len(index), len(index)), fill)
+    distances[np.ix_(positions, positions)] = text_distances
+    np.fill_diagonal(distances, 0.0)
+    return distances, fill
 
 
 def pool_mean_distance(distances: np.ndarray) -> float:
@@ -863,11 +849,14 @@ def table_preferences(
     table: int,
     member_ids: Sequence[str],
     member_embeddings: np.ndarray | None,
+    missing_embeddings_reason: str = "participant_embedding_failed",
 ) -> tuple[SlotPreferences, SlotPreferences]:
     """The table's maximin and bridging preferences over the candidates.
 
     A table's own comments (by members linked to the pre-survey) are not
     allowed. A method that cannot run falls back to the global bridging order.
+    member_embeddings holds only members who wrote usable text; when there
+    are none, maximin falls back with missing_embeddings_reason.
     """
     catalog = context.catalog
     candidates = context.candidate_rows
@@ -888,7 +877,7 @@ def table_preferences(
         return SlotPreferences(table, method, global_order, allowed, fallback_reason=reason)
 
     if member_embeddings is None:
-        maximin = fallback("maximin", "participant_embedding_failed")
+        maximin = fallback("maximin", missing_embeddings_reason)
     else:
         try:
             maximin = SlotPreferences(
@@ -1060,13 +1049,16 @@ class TextMatchingService:
 
     def match(
         self,
-        participant_responses: dict[str, str],
+        participant_responses: dict[str, str | None],
         target_group_size: int,
         request=None,
         identities: dict[str, tuple[str | None, str | None]] | None = None,
     ) -> list[TextMatchGroup]:
-        """identities maps each id to (email, name) for linking to the pre-survey."""
+        """participant_responses maps each id to their text, or None when they
+        gave none usable. identities maps each id to (email, name) for linking
+        to the pre-survey."""
         participant_ids = list(participant_responses)
+        text_ids = [pid for pid in participant_ids if participant_responses[pid]]
         group_sizes = plan_group_sizes(len(participant_ids), target_group_size)
         seed = _stable_seed(participant_ids)
         log.log_event("INFO", "Matching configuration", request, extra_data={
@@ -1086,9 +1078,21 @@ class TextMatchingService:
             "embedding_model_revision": _provenance("HF_MODEL_REVISION"),
         })
 
+        if len(text_ids) < 2:
+            log.log_event(
+                "WARNING",
+                f"Only {len(text_ids)} participant(s) have usable text, so no "
+                f"distances exist; using random fallback",
+                request=request,
+                extra_data={"participant_count": len(participant_ids)},
+            )
+            return self._fallback_groups(
+                participant_ids, group_sizes, seed, identities or {}, request
+            )
+
         try:
             participant_embeddings = self.embedding_client.embed(
-                list(participant_responses.values())
+                [participant_responses[pid] for pid in text_ids]
             )
         except EmbeddingServiceError as exc:
             log.log_event(
@@ -1104,7 +1108,10 @@ class TextMatchingService:
         # Randomisation into condition pools happens here, after embedding, so a
         # REQUIRE_REAL_TEXT failure aborts before anyone is assigned, and before
         # any distance-based decision is taken.
-        distances = cosine_distance_matrix(participant_embeddings)
+        missing_text_ids = [pid for pid in participant_ids if not participant_responses[pid]]
+        distances, fill = fill_missing_text_distances(
+            participant_ids, text_ids, cosine_distance_matrix(participant_embeddings)
+        )
         participant_count = len(participant_ids)
         entry_count = 0
         rows_logged = participant_count <= DISTANCE_LOG_MAX_PARTICIPANTS
@@ -1133,6 +1140,8 @@ class TextMatchingService:
         log.log_event("INFO", "Participant distances complete", request, extra_data={
             "participant_count": participant_count,
             "embedding_dimensions": int(participant_embeddings.shape[1]),
+            "missing_text_participant_ids": missing_text_ids,
+            "missing_text_fill_distance": fill if missing_text_ids else None,
             "rows_logged": rows_logged,
             "entry_count": entry_count,
             "max_participants": DISTANCE_LOG_MAX_PARTICIPANTS,
@@ -1152,7 +1161,7 @@ class TextMatchingService:
         # Groups are final from here on. Nothing below may change or fail them.
         embedding_by_id = {
             participant_id: participant_embeddings[index]
-            for index, participant_id in enumerate(participant_ids)
+            for index, participant_id in enumerate(text_ids)
         }
         placed = [
             (arm, group, achieved)
@@ -1191,17 +1200,20 @@ class TextMatchingService:
             text = format_statements(FALLBACK_STATEMENT, FALLBACK_STATEMENT)
             return [TableStatements(text, reason, reason) for _ in groups]
 
-        preferences = [
-            slot
-            for table, group in enumerate(groups)
-            for slot in table_preferences(
-                context,
-                table,
-                group,
-                None if embedding_by_id is None
-                else np.vstack([embedding_by_id[pid] for pid in group]),
-            )
-        ]
+        def member_embeddings(group):
+            """Embeddings of members with usable text, and why there are none."""
+            if embedding_by_id is None:
+                return None, "participant_embedding_failed"
+            rows = [embedding_by_id[pid] for pid in group if pid in embedding_by_id]
+            return (np.vstack(rows), None) if rows else (None, "no_member_text")
+
+        preferences = []
+        for table, group in enumerate(groups):
+            embeddings, reason = member_embeddings(group)
+            preferences.extend(table_preferences(
+                context, table, group, embeddings,
+                **({"missing_embeddings_reason": reason} if reason else {}),
+            ))
         assignment = assign_statements(context, preferences)
 
         order_rng = random.Random(seed ^ 0xAB0DE)

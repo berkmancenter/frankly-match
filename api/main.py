@@ -23,7 +23,6 @@ from pydantic import BaseModel, field_validator, model_validator
 from match import group_match
 from text_match import (
     TextMatchingService,
-    placeholder_responses,
     plan_group_sizes,
 )
 
@@ -266,35 +265,34 @@ def _normalize_masks(participants: dict[str, ParticipantData]) -> dict[str, str]
 def _text_responses(
     participants: dict[str, ParticipantData],
     request: Request | None = None,
-) -> dict[str, str]:
-    placeholders = placeholder_responses(list(participants))
-    responses: dict[str, str] = {}
-    placeholder_ids: list[str] = []
+) -> dict[str, str | None]:
+    """Each participant's trimmed text, or None when they gave none usable.
+
+    Nobody is given stand-in text: the matching service places a participant
+    without text at the average distance from everyone instead.
+    """
+    responses: dict[str, str | None] = {}
+    missing_ids: list[str] = []
     for participant_id, data in participants.items():
         supplied = data.freeTextResponse.strip() if data.freeTextResponse else ""
-        # TODO: Remove placeholder responses once freeTextResponse is guaranteed in the payload.
         if not supplied:
-            placeholder_ids.append(participant_id)
-        responses[participant_id] = supplied or placeholders[participant_id]
+            missing_ids.append(participant_id)
+        responses[participant_id] = supplied or None
 
-    placeholder_set = set(placeholder_ids)
-    # One-shot-event protection: groups formed from placeholder text are
-    # meaningless but look statistically perfect, so a silent substitution at a
-    # live event would burn the only demonstration. Strict mode turns the silent
-    # fallback into a loud, listable refusal. Enable REQUIRE_REAL_TEXT=1 in the
-    # deployed environment for real events; leave off for demos and tests.
-    if placeholder_ids and os.getenv("REQUIRE_REAL_TEXT", "").lower() in {"1", "true", "yes"}:
-        raise MissingTextResponses(placeholder_ids)
+    # Strict mode refuses the whole request instead. Frankly then falls back
+    # to its own matching for everyone, so this is off for live events.
+    if missing_ids and os.getenv("REQUIRE_REAL_TEXT", "").lower() in {"1", "true", "yes"}:
+        raise MissingTextResponses(missing_ids)
 
     log.log_event(
         "INFO",
         f"Collected {len(responses)} participant responses "
-        f"({len(placeholder_ids)} placeholder)",
+        f"({len(missing_ids)} without usable text)",
         request=request,
         extra_data={
             "participant_count": len(responses),
-            "placeholder_count": len(placeholder_ids),
-            "placeholder_participant_ids": placeholder_ids,
+            "missing_text_count": len(missing_ids),
+            "missing_text_participant_ids": missing_ids,
             # This is what used to ride back in MatchResponse.participantResponses.
             "responses": [
                 {
@@ -302,8 +300,8 @@ def _text_responses(
                     "email": participants[participant_id].email,
                     "name": participants[participant_id].name,
                     "response": text,
-                    "response_length": len(text),
-                    "is_placeholder": participant_id in placeholder_set,
+                    "response_length": len(text) if text else 0,
+                    "has_text": text is not None,
                 }
                 for participant_id, text in responses.items()
             ],
