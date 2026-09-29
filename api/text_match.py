@@ -1243,13 +1243,22 @@ class TextMatchingService:
     ) -> PreSurveyContext:
         try:
             catalog = load_comment_catalog()
-            eligible = load_eligible_comment_ids()
         except Exception as exc:
             # The catalog ships with the code, so this is a broken deployment.
             log.log_event(
                 "ERROR", f"Pre-survey comment catalog failed to load: {exc}", request,
             )
             return PreSurveyContext(catalog=None, matrix=None, links={})
+
+        # Loaded on its own so a failure names the right file. With no screen
+        # there are no candidates: unscreened comments are never shown.
+        try:
+            eligible = load_eligible_comment_ids()
+        except Exception as exc:
+            log.log_event(
+                "ERROR", f"Diffusion eligibility screen failed to load: {exc}", request,
+            )
+            eligible = frozenset()
 
         candidate_rows = tuple(
             row for row, comment in enumerate(catalog.comments)

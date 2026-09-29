@@ -609,6 +609,29 @@ class TextMatchingServiceTests(unittest.TestCase):
         self.assertTrue(all(group.achieved_diversity is not None for group in groups))
         self.assertTrue(all(FALLBACK_STATEMENT in group.diffusion_statement for group in groups))
 
+    def test_a_broken_eligibility_file_is_named_and_linking_still_runs(self):
+        """Without the screen nothing is eligible, so tables get the fallback
+        text rather than unscreened comments; the error names the file, and
+        the pre-survey linking is still logged."""
+        service = self._stub_service(np.asarray([[1.0, 0.0], [0.9, 0.1], [0.8, 0.2]] * 2))
+        catalog, _, ranking = self._stubbed()
+        with catalog, ranking, \
+                patch("text_match.load_eligible_comment_ids", side_effect=ValueError("truncated")), \
+                patch("text_match.load_approval_matrix", return_value=STUB_MATRIX), \
+                patch("text_match.log.log_event") as logged:
+            service.approval_matrix_uri = "stub"
+            groups = service.match({f"p{i}": f"r{i}" for i in range(6)}, 3)
+
+        messages = [(call.args[0], call.args[1]) for call in logged.call_args_list]
+        self.assertTrue(any(
+            level == "ERROR" and "eligibility screen failed to load" in message
+            for level, message in messages
+        ))
+        self.assertFalse(any("catalog failed to load" in message for _, message in messages))
+        self.assertIn(("INFO", "Pre-survey linking"), messages)
+        self.assertTrue(all(group.achieved_diversity is not None for group in groups))
+        self.assertTrue(all(FALLBACK_STATEMENT in group.diffusion_statement for group in groups))
+
     def test_a_broken_ranking_file_only_affects_fallback_order(self):
         """The ranking is a fallback aid: losing it must not blank the
         statements tables can compute for themselves."""
