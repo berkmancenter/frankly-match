@@ -1244,7 +1244,6 @@ class TextMatchingService:
         try:
             catalog = load_comment_catalog()
             eligible = load_eligible_comment_ids()
-            ranking = load_bridging_ranking()
         except Exception as exc:
             # The catalog ships with the code, so this is a broken deployment.
             log.log_event(
@@ -1256,6 +1255,18 @@ class TextMatchingService:
             row for row, comment in enumerate(catalog.comments)
             if comment.topic_id == DIFFUSION_TOPIC_ID and comment.comment_id in eligible
         )
+        # The ranking only orders fallbacks, so losing it must not cost the
+        # statements every table can compute for itself.
+        try:
+            ranking = load_bridging_ranking()
+        except Exception as exc:
+            log.log_event(
+                "ERROR",
+                f"Global bridging ranking failed to load; fallback statements "
+                f"will be in catalog order: {exc}",
+                request,
+            )
+            ranking = ()
         row_of = {comment.comment_id: row for row, comment in enumerate(catalog.comments)}
         fallback_rows = tuple(row_of[cid] for cid in ranking if row_of.get(cid) in candidate_rows)
         matrix = None

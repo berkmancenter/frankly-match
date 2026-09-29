@@ -609,6 +609,23 @@ class TextMatchingServiceTests(unittest.TestCase):
         self.assertTrue(all(group.achieved_diversity is not None for group in groups))
         self.assertTrue(all(FALLBACK_STATEMENT in group.diffusion_statement for group in groups))
 
+    def test_a_broken_ranking_file_only_affects_fallback_order(self):
+        """The ranking is a fallback aid: losing it must not blank the
+        statements tables can compute for themselves."""
+        service = self._stub_service(np.asarray([[1.0, 0.0], [0.9, 0.1], [0.8, 0.2]] * 2))
+        catalog, eligible, _ = self._stubbed()
+        with catalog, eligible, \
+                patch("text_match.load_bridging_ranking", side_effect=ValueError("truncated")), \
+                patch("text_match.log.log_event") as logged:
+            groups = service.match({f"p{i}": f"r{i}" for i in range(6)}, 3)
+
+        for group in groups:
+            self.assertNotIn(FALLBACK_STATEMENT, group.diffusion_statement)
+        self.assertTrue(any(
+            call.args[0] == "ERROR" and "ranking failed to load" in call.args[1]
+            for call in logged.call_args_list
+        ))
+
     def test_a_dimension_mismatch_falls_back_without_touching_groups(self):
         """Registration embeddings from a different model than the catalog."""
         service = self._stub_service(np.eye(6))

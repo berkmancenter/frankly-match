@@ -170,6 +170,10 @@ class SourceTests(unittest.TestCase):
 class GcsDownloadTests(unittest.TestCase):
     """The GCS library is not installed locally, so a stand-in module plays it."""
 
+    def setUp(self):
+        presurvey._gcs_client.cache_clear()
+        self.addCleanup(presurvey._gcs_client.cache_clear)
+
     def _storage(self, outcomes):
         calls = []
 
@@ -197,11 +201,26 @@ class GcsDownloadTests(unittest.TestCase):
         module, calls = self._storage([ConnectionError("reset"), b"data"])
         with patch.dict(sys.modules, {"google.cloud.storage": module}):
             self.assertEqual(presurvey._download_gcs("b", "o"), b"data")
+        presurvey._gcs_client.cache_clear()
         module, calls = self._storage([TimeoutError("slow")] * presurvey.GCS_ATTEMPTS)
         with patch.dict(sys.modules, {"google.cloud.storage": module}), \
                 self.assertRaises(TimeoutError):
             presurvey._download_gcs("b", "o")
         self.assertEqual(len(calls), presurvey.GCS_ATTEMPTS)
+
+    def test_the_client_is_built_once_and_a_failed_build_counts_as_an_attempt(self):
+        module, _ = self._storage([b"one", b"two"])
+        with patch.dict(sys.modules, {"google.cloud.storage": module}):
+            presurvey._download_gcs("b", "o")
+            presurvey._download_gcs("b", "o")
+        self.assertEqual(module.Client.call_count, 1)
+
+        presurvey._gcs_client.cache_clear()
+        module, _ = self._storage([b"data"])
+        client = module.Client.return_value
+        module.Client.side_effect = [OSError("no credentials yet"), client]
+        with patch.dict(sys.modules, {"google.cloud.storage": module}):
+            self.assertEqual(presurvey._download_gcs("b", "o"), b"data")
 
 
 class LinkingTests(unittest.TestCase):
