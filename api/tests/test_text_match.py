@@ -1,8 +1,11 @@
+import itertools
 import unittest
 import hashlib
 import os
 from unittest.mock import patch
 from itertools import combinations
+
+import json
 
 import numpy as np
 
@@ -19,8 +22,61 @@ from text_match import (
     plan_arm_counts,
     plan_group_sizes,
     pool_mean_distance,
-    select_diffusion_statement,
+    PreSurveyContext,
+    fill_missing_text_distances,
+    maximin_scores,
+    assign_statements,
+    format_statements,
+    table_preferences,
 )
+from presurvey import ApprovalMatrix, Link, parse_comment_catalog
+
+
+def _catalog(entries):
+    """entries: (comment_id, topic_id, author_pid, text, [x, y])."""
+    return parse_comment_catalog(json.dumps({
+        "schema_version": 1,
+        "topics": {"stocking_growing": {}, "food_access": {}},
+        "embedding_metadata": {"dimensions": 2},
+        "comments": {
+            cid: {"comment_id": cid, "topic_id": topic, "author_pid": author,
+                  "text": text, "embedding": vector}
+            for cid, topic, author, text, vector in entries
+        },
+    }).encode())
+
+
+STUB_CATALOG = _catalog([
+    ("near", "stocking_growing", "pid_near", "near", [1.0, 0.0]),
+    ("side", "stocking_growing", "pid_side", "side  \n\n comment", [0.0, 1.0]),
+    ("far", "stocking_growing", "pid_far", "far", [-1.0, 0.0]),
+    ("screened_out", "stocking_growing", "pid_x", "screened out", [-1.0, 0.0]),
+    ("other_topic", "food_access", "pid_y", "other topic", [-1.0, 0.0]),
+])
+STUB_ELIGIBLE = frozenset({"near", "side", "far", "other_topic"})
+STUB_RANKING = ("side", "near", "far")
+# Columns in catalog order: near, side, far, screened_out, other_topic.
+# Voters a and b disagree on everything except that both approve "side".
+STUB_MATRIX = ApprovalMatrix(
+    pids=("v_a", "v_b", "pid_far"),
+    emails=("a", "b", "c"),
+    names=("A", "B", "C"),
+    probabilities=np.asarray([
+        [1.0, 1.0, 0.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0, 1.0],
+        [1.0, 1.0, 1.0, 1.0, 1.0],
+    ]),
+    source="stub",
+    sha256="stub",
+)
+LINKED_AB = {"a": Link("a", "email", 0, "v_a"), "b": Link("b", "email", 1, "v_b")}
+
+
+def _context(links=None, matrix=STUB_MATRIX, catalog=STUB_CATALOG):
+    return PreSurveyContext(
+        catalog=catalog, matrix=matrix, links=links if links is not None else LINKED_AB,
+        candidate_rows=(0, 1, 2), fallback_rows=(1, 0, 2),
+    )
 
 
 class QueueEmbeddingClient:
@@ -123,20 +179,205 @@ class DiversityTargetTests(unittest.TestCase):
             ),
         )
 
-    def test_selects_statement_with_best_minimum_distance(self):
-        group_embeddings = np.asarray([[1.0, 0.0], [0.8, 0.2]])
-        statement_embeddings = np.asarray(
-            [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]]
+    def test_maximin_scores_each_candidate_by_its_nearest_member(self):
+        members = np.asarray([[1.0, 0.0], [0.0, 1.0]])
+        candidates = np.asarray([[1.0, 0.0], [-1.0, 0.0], [-1.0, -1.0]])
+        scores = maximin_scores(members, candidates)
+        # [-1, -1] is 135 degrees from both members; [-1, 0] is only 90
+        # degrees from the second.
+        np.testing.assert_allclose(scores, [0.0, 1.0, 1.0 + 2 ** -0.5])
+
+    def test_maximin_refuses_mismatched_dimensions(self):
+        with self.assertRaises(ValueError):
+            maximin_scores(np.ones((2, 3)), np.ones((2, 2)))
+
+
+
+def _assign(context, tables):
+    """tables: list of (member_ids, member_embeddings or None)."""
+    preferences = [
+        slot for t, (members, embeddings) in enumerate(tables)
+        for slot in table_preferences(context, t, members, embeddings)
+    ]
+    return assign_statements(context, preferences)
+
+
+class MissingTextTests(unittest.TestCase):
+    def test_no_text_participants_sit_at_the_mean_real_distance(self):
+        real = cosine_distance_matrix(np.asarray([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]]))
+        distances, fill = fill_missing_text_distances(["a", "x", "b", "c", "y"], ["a", "b", "c"], real)
+        known = [real[0, 1], real[0, 2], real[1, 2]]
+        self.assertAlmostEqual(fill, np.mean(known))
+        # x and y are at the fill distance from everyone, each other included.
+        for other in range(5):
+            if other not in (1,):
+                self.assertAlmostEqual(distances[1, other], fill)
+        self.assertAlmostEqual(distances[1, 4], fill)
+        self.assertEqual(distances[1, 1], 0.0)
+        np.testing.assert_allclose(distances[np.ix_([0, 2, 3], [0, 2, 3])], real)
+        # The pool mean, which every target is built on, is unchanged.
+        self.assertAlmostEqual(pool_mean_distance(distances), pool_mean_distance(real))
+
+    def _service(self, embeddings):
+        return TextMatchingService(
+            embedding_client=QueueEmbeddingClient([embeddings]), optimization_seconds=0,
         )
 
-        selected = select_diffusion_statement(
-            group_embeddings,
-            statement_embeddings,
-            ["near", "different", "opposite"],
+    def test_only_real_text_is_embedded_and_no_text_is_logged(self):
+        class Recording(QueueEmbeddingClient):
+            def embed(self, sentences):
+                self.sentences = list(sentences)
+                return super().embed(sentences)
+
+        client = Recording([np.random.default_rng(2).normal(size=(5, 2))])
+        service = TextMatchingService(embedding_client=client, optimization_seconds=0)
+        responses = {f"p{i}": f"text {i}" for i in range(5)}
+        responses["q"] = None
+        with patch("text_match.load_comment_catalog", return_value=STUB_CATALOG), \
+                patch("text_match.load_eligible_comment_ids", return_value=STUB_ELIGIBLE), \
+                patch("text_match.load_bridging_ranking", return_value=STUB_RANKING), \
+                patch("text_match.log.log_event") as logged:
+            groups = service.match(responses, 3)
+
+        self.assertEqual(client.sentences, [f"text {i}" for i in range(5)])
+        self.assertEqual(sorted(p for g in groups for p in g.participant_ids), sorted(responses))
+        complete = next(
+            call.kwargs["extra_data"] for call in logged.call_args_list
+            if call.args[1] == "Participant distances complete"
         )
+        self.assertEqual(complete["missing_text_participant_ids"], ["q"])
+        self.assertIsNotNone(complete["missing_text_fill_distance"])
 
-        self.assertEqual(selected, "opposite")
+    def test_a_table_where_nobody_wrote_text_falls_back_for_maximin_only(self):
+        context = _context()
+        maximin, bridging = table_preferences(
+            context, 0, ["a", "b"], None, missing_embeddings_reason="no_member_text",
+        )
+        self.assertEqual(maximin.fallback_reason, "no_member_text")
+        self.assertIsNone(bridging.fallback_reason)
 
+    def test_fewer_than_two_texts_means_random_groups_with_real_statements(self):
+        service = self._service(np.eye(2))
+        responses = {f"p{i}": None for i in range(6)}
+        responses["p0"] = "only one"
+        with patch("text_match.log.log_event") as logged:
+            groups = service.match(responses, 3)
+        self.assertTrue(all(g.diversity_level == "unknown" for g in groups))
+        self.assertTrue(all(FALLBACK_STATEMENT not in g.diffusion_statement for g in groups))
+        self.assertTrue(any("usable text" in call.args[1] for call in logged.call_args_list))
+
+
+class TablePreferenceTests(unittest.TestCase):
+    MEMBERS = ["a", "b"]
+    NEAR_1_0 = np.asarray([[1.0, 0.0], [1.0, 0.0]])
+
+    def test_both_methods_score_every_candidate(self):
+        maximin, bridging = table_preferences(_context(), 0, self.MEMBERS, self.NEAR_1_0)
+        # Members sit at [1, 0]: near, side, far are 0, 1 and 2 away.
+        np.testing.assert_allclose(maximin.scores, [0.0, 1.0, 2.0])
+        # a and b disagree on 3 of the 4 other comments and both approve only
+        # "side": 2 ordered pairs * 3 / (n^2 = 4 * m = 5).
+        np.testing.assert_allclose(bridging.scores, [0.0, 0.3, 0.0])
+        self.assertEqual((bridging.population_size, bridging.observed_share), (2, 1.0))
+        self.assertIsNone(bridging.fallback_reason)
+
+    def test_own_comments_are_not_allowed(self):
+        links = {**LINKED_AB, "c": Link("c", "email", 2, "pid_far")}
+        maximin, _ = table_preferences(_context(links), 0, ["a", "b", "c"], np.asarray([[1.0, 0.0]] * 3))
+        np.testing.assert_array_equal(maximin.allowed, [True, True, False])
+
+    def test_methods_that_cannot_run_rank_by_the_global_order(self):
+        for context, members, embeddings, method, reason in (
+            (_context(matrix=None), self.MEMBERS, self.NEAR_1_0, 1, "matrix_unavailable"),
+            (_context(links={"a": LINKED_AB["a"]}), self.MEMBERS, self.NEAR_1_0, 1, "fewer_than_two_linked"),
+            # Two registrants on one pre-survey row are one voter.
+            (_context(links={"a": LINKED_AB["a"], "b": Link("b", "name", 0, "v_a")}),
+             self.MEMBERS, self.NEAR_1_0, 1, "fewer_than_two_linked"),
+            (_context(), self.MEMBERS, None, 0, "participant_embedding_failed"),
+            (_context(), self.MEMBERS, np.ones((2, 3)), 0, "pick_failed"),
+        ):
+            with self.subTest(reason=reason):
+                slot = table_preferences(context, 0, members, embeddings)[method]
+                self.assertTrue(slot.fallback_reason.startswith(reason))
+                # fallback_rows is (side, near, far).
+                np.testing.assert_array_equal(slot.ranks(), [1, 0, 2])
+
+
+SIX_CANDIDATES = PreSurveyContext(
+    catalog=_catalog([
+        (f"c{i}", "stocking_growing", f"author{i}", f"text {i}", [np.cos(i), np.sin(i)])
+        for i in range(6)
+    ]),
+    matrix=None, links={}, candidate_rows=tuple(range(6)), fallback_rows=(3, 1, 4, 0, 5, 2),
+)
+
+
+class AssignmentTests(unittest.TestCase):
+    def test_a_lone_table_gets_each_methods_top_choice(self):
+        result = _assign(_context(), [(["a", "b"], np.asarray([[1.0, 0.0]] * 2))])
+        maximin, bridging = result.choices
+        self.assertEqual((maximin.comment_id, maximin.rank), ("far", 0))
+        self.assertEqual((bridging.comment_id, bridging.rank), ("side", 0))
+        self.assertAlmostEqual(bridging.score, 0.3)
+        self.assertEqual(result.total_rank, 0)
+
+    def test_tables_never_share_a_comment_while_candidates_last(self):
+        # Two identical tables want the same comments; with 6 candidates for
+        # 4 slots, each comment is used once and the second table gives way.
+        context = SIX_CANDIDATES
+        same = np.asarray([[1.0, 0.2]])
+        result = _assign(context, [(["x"], same), (["y"], same)])
+        self.assertEqual(result.max_uses_per_comment, 1)
+        self.assertEqual(len({choice.comment_id for choice in result.choices}), 4)
+
+    def test_comments_are_reused_only_once_candidates_run_out(self):
+        # 4 slots over 3 candidates: each comment may appear twice.
+        near = np.asarray([[1.0, 0.0]] * 2)
+        result = _assign(_context(matrix=None), [(["a", "b"], near), (["a", "b"], near)])
+        self.assertEqual(result.max_uses_per_comment, 2)
+        ids = [choice.comment_id for choice in result.choices]
+        # Every candidate is used before any is used twice: one reuse only.
+        self.assertEqual(sorted(ids.count(c) for c in set(ids)), [1, 1, 2])
+
+    def test_a_table_never_shows_the_same_comment_twice(self):
+        near = np.asarray([[1.0, 0.0]] * 2)
+        result = _assign(_context(matrix=None), [(["a", "b"], near)] * 3)
+        for t in range(3):
+            self.assertNotEqual(result.choices[2 * t].comment_id, result.choices[2 * t + 1].comment_id)
+
+    def test_a_duplicate_is_worse_than_showing_a_table_its_own_comment(self):
+        """The table's members wrote "near" and "side", leaving only "far".
+        Rather than show "far" twice, one slot gets a member's own comment."""
+        links = {"a": Link("a", "email", 0, "pid_near"), "b": Link("b", "email", 1, "pid_side")}
+        result = _assign(_context(links=links, matrix=None), [(["a", "b"], np.asarray([[1.0, 0.0]] * 2))])
+        ids = [c.comment_id for c in result.choices]
+        self.assertEqual(ids[0], "far")
+        self.assertNotEqual(ids[0], ids[1])
+        self.assertEqual(result.unresolved_collisions, 0)
+
+    def test_an_unresolvable_collision_ends_instead_of_looping(self):
+        """Regression: with a single candidate both slots must share it. This
+        used to retry forever."""
+        context = PreSurveyContext(
+            catalog=STUB_CATALOG, matrix=None, links={}, candidate_rows=(2,), fallback_rows=(2,),
+        )
+        result = _assign(context, [(["a"], np.asarray([[1.0, 0.0]]))])
+        self.assertEqual([c.comment_id for c in result.choices], ["far", "far"])
+        self.assertEqual(result.unresolved_collisions, 1)
+
+    def test_the_assignment_minimises_total_rank(self):
+        """Brute force over every way to give 2 tables' 4 slots distinct
+        comments from 6 candidates."""
+        context = SIX_CANDIDATES
+        tables = [(["x"], np.asarray([[1.0, 0.2]])), (["y"], np.asarray([[-0.3, 1.0]]))]
+        preferences = [s for t, (m, e) in enumerate(tables) for s in table_preferences(context, t, m, e)]
+        ranks = np.vstack([p.ranks() for p in preferences])
+        best = min(sum(ranks[k, c] for k, c in enumerate(cols))
+                   for cols in itertools.permutations(range(6), 4))
+        self.assertEqual(assign_statements(context, preferences).total_rank, best)
+
+    def test_format(self):
+        self.assertEqual(format_statements("x", "y"), "Statement A: x\n\nStatement B: y")
 
 
 class EventDesignTests(unittest.TestCase):
@@ -312,8 +553,7 @@ class TextMatchingServiceTests(unittest.TestCase):
     def test_logged_distances_reconstruct_group_diversity(self):
         embeddings = np.random.default_rng(7).normal(size=(100, 5))
         service = TextMatchingService(
-            embedding_client=QueueEmbeddingClient([embeddings, np.ones((1, 5))]),
-            diffusion_statements=("statement",), optimization_seconds=0,
+            embedding_client=QueueEmbeddingClient([embeddings, np.ones((1, 5))]), optimization_seconds=0,
         )
         with patch("text_match.log.log_event") as logged:
             groups = service.match({f"p{i}": f"text {i}" for i in range(100)}, 4)
@@ -344,8 +584,7 @@ class TextMatchingServiceTests(unittest.TestCase):
         says so, and the checksum still present."""
         embeddings = np.random.default_rng(3).normal(size=(12, 5))
         service = TextMatchingService(
-            embedding_client=QueueEmbeddingClient([embeddings, np.ones((1, 5))]),
-            diffusion_statements=("statement",), optimization_seconds=0,
+            embedding_client=QueueEmbeddingClient([embeddings, np.ones((1, 5))]), optimization_seconds=0,
         )
         with patch("text_match.DISTANCE_LOG_MAX_PARTICIPANTS", 10), patch("text_match.log.log_event") as logged:
             service.match({f"p{i}": f"text {i}" for i in range(12)}, 4)
@@ -363,8 +602,7 @@ class TextMatchingServiceTests(unittest.TestCase):
         Those must read as missing in the study export, not as recorded."""
         embeddings = np.random.default_rng(5).normal(size=(12, 5))
         service = TextMatchingService(
-            embedding_client=QueueEmbeddingClient([embeddings, np.ones((1, 5))]),
-            diffusion_statements=("statement",), optimization_seconds=0,
+            embedding_client=QueueEmbeddingClient([embeddings, np.ones((1, 5))]), optimization_seconds=0,
         )
         env = {"MATCH_CODE_REVISION": "   ", "HF_MODEL_REVISION": " abc123 "}
         with patch.dict(os.environ, env), patch("text_match.log.log_event") as logged:
@@ -378,47 +616,121 @@ class TextMatchingServiceTests(unittest.TestCase):
         self.assertIsNone(config["embedding_model"])
         self.assertEqual(config["embedding_model_revision"], "abc123")
 
-    def test_returns_diffusion_statement_for_each_group(self):
-        participant_embeddings = np.asarray(
-            [
-                [1.0, 0.0],
-                [0.7, 0.7],
-                [0.0, 1.0],
-                [-0.7, 0.7],
-                [-1.0, 0.0],
-                [-0.7, -0.7],
-            ]
-        )
-        diffusion_embeddings = np.asarray(
-            [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]]
-        )
-        service = TextMatchingService(
-            embedding_client=QueueEmbeddingClient(
-                [participant_embeddings, diffusion_embeddings]
-            ),
-            diffusion_statements=("first", "second", "third"),
+    def _stub_service(self, participant_embeddings):
+        return TextMatchingService(
+            embedding_client=QueueEmbeddingClient([participant_embeddings]),
             optimization_seconds=0,
         )
 
-        groups = service.match(
-            {f"p{index}": f"response {index}" for index in range(6)},
-            3,
+    def _stubbed(self):
+        return (
+            patch("text_match.load_comment_catalog", return_value=STUB_CATALOG),
+            patch("text_match.load_eligible_comment_ids", return_value=STUB_ELIGIBLE),
+            patch("text_match.load_bridging_ranking", return_value=STUB_RANKING),
         )
 
-        self.assertEqual([len(group.participant_ids) for group in groups], [3, 3])
-        self.assertTrue(all(not group.fallback_used for group in groups))
-        # Two groups cannot identify three levels, so both are targeted at the
-        # pool mean rather than silently running a two-level design.
-        self.assertTrue(all(group.diversity_level == "medium" for group in groups))
-        self.assertTrue(
-            all(group.achieved_diversity is not None for group in groups)
+    def test_each_group_gets_two_labelled_statements_in_a_logged_order(self):
+        embeddings = np.asarray([[1.0, 0.0], [0.9, 0.1], [0.8, 0.2]] * 4)
+        service = self._stub_service(embeddings)
+        catalog, eligible, ranking = self._stubbed()
+        with catalog, eligible, ranking, patch("text_match.log.log_event") as logged:
+            groups = service.match({f"p{i}": f"r{i}" for i in range(12)}, 3)
+
+        record = next(
+            call.kwargs["extra_data"] for call in logged.call_args_list
+            if call.args[1] == "Diffusion picks"
         )
-        self.assertTrue(
-            all(
-                group.diffusion_statement in {"first", "second", "third"}
-                for group in groups
+        self.assertEqual(record["candidate_count"], 3)
+        # 4 tables x 2 slots over 3 candidates: each comment is used at most
+        # 3 times, and "far" (everyone's maximin favourite) goes to one table.
+        self.assertEqual(record["max_uses_per_comment"], 3)
+        maximin_ids = [g["maximin"]["comment_id"] for g in record["groups"]]
+        self.assertLessEqual(max(maximin_ids.count(c) for c in set(maximin_ids)), 3)
+        for group, logged_group in zip(groups, record["groups"]):
+            # No matrix is configured: maximin runs, bridging falls back.
+            self.assertIsNone(logged_group["maximin"]["fallback_reason"])
+            self.assertEqual(logged_group["bridging"]["fallback_reason"], "matrix_unavailable")
+            self.assertNotEqual(
+                logged_group["maximin"]["comment_id"], logged_group["bridging"]["comment_id"]
             )
-        )
+            first = logged_group[logged_group["slot_a_method"]]["text"]
+            second_method = "bridging" if logged_group["slot_a_method"] == "maximin" else "maximin"
+            self.assertEqual(
+                group.diffusion_statement,
+                format_statements(first, logged_group[second_method]["text"]),
+            )
+        for group in groups:
+            self.assertIsNone(group.maximin_fallback_reason)
+            self.assertEqual(group.bridging_fallback_reason, "matrix_unavailable")
+        # The order is randomised per group, and reproducible from the seed.
+        self.assertEqual(len({g["slot_a_method"] for g in record["groups"]}), 2)
+
+    def test_a_catalog_failure_preserves_optimized_groups(self):
+        service = self._stub_service(np.eye(6))
+        with patch("text_match.load_comment_catalog", side_effect=OSError("missing")), \
+                patch("text_match.log.log_event"):
+            groups = service.match({f"p{i}": f"r{i}" for i in range(6)}, 3)
+
+        self.assertTrue(all(group.fallback_used for group in groups))
+        # Only the statements failed, so the optimized groups and all their
+        # diversity measurements survive.
+        self.assertTrue(all(group.diversity_level != "unknown" for group in groups))
+        self.assertTrue(all(group.achieved_diversity is not None for group in groups))
+        self.assertTrue(all(FALLBACK_STATEMENT in group.diffusion_statement for group in groups))
+
+    def test_a_broken_eligibility_file_is_named_and_linking_still_runs(self):
+        """Without the screen nothing is eligible, so tables get the fallback
+        text rather than unscreened comments; the error names the file, and
+        the pre-survey linking is still logged."""
+        service = self._stub_service(np.asarray([[1.0, 0.0], [0.9, 0.1], [0.8, 0.2]] * 2))
+        catalog, _, ranking = self._stubbed()
+        with catalog, ranking, \
+                patch("text_match.load_eligible_comment_ids", side_effect=ValueError("truncated")), \
+                patch("text_match.load_approval_matrix", return_value=STUB_MATRIX), \
+                patch("text_match.log.log_event") as logged:
+            service.approval_matrix_uri = "stub"
+            groups = service.match({f"p{i}": f"r{i}" for i in range(6)}, 3)
+
+        messages = [(call.args[0], call.args[1]) for call in logged.call_args_list]
+        self.assertTrue(any(
+            level == "ERROR" and "eligibility screen failed to load" in message
+            for level, message in messages
+        ))
+        self.assertFalse(any("catalog failed to load" in message for _, message in messages))
+        self.assertIn(("INFO", "Pre-survey linking"), messages)
+        self.assertTrue(all(group.achieved_diversity is not None for group in groups))
+        self.assertTrue(all(FALLBACK_STATEMENT in group.diffusion_statement for group in groups))
+
+    def test_a_broken_ranking_file_only_affects_fallback_order(self):
+        """The ranking is a fallback aid: losing it must not blank the
+        statements tables can compute for themselves."""
+        service = self._stub_service(np.asarray([[1.0, 0.0], [0.9, 0.1], [0.8, 0.2]] * 2))
+        catalog, eligible, _ = self._stubbed()
+        with catalog, eligible, \
+                patch("text_match.load_bridging_ranking", side_effect=ValueError("truncated")), \
+                patch("text_match.log.log_event") as logged:
+            groups = service.match({f"p{i}": f"r{i}" for i in range(6)}, 3)
+
+        for group in groups:
+            self.assertNotIn(FALLBACK_STATEMENT, group.diffusion_statement)
+        self.assertTrue(any(
+            call.args[0] == "ERROR" and "ranking failed to load" in call.args[1]
+            for call in logged.call_args_list
+        ))
+
+    def test_a_dimension_mismatch_falls_back_without_touching_groups(self):
+        """Registration embeddings from a different model than the catalog."""
+        service = self._stub_service(np.eye(6))
+        catalog, eligible, ranking = self._stubbed()
+        with catalog, eligible, ranking, patch("text_match.log.log_event") as logged:
+            groups = service.match({f"p{i}": f"r{i}" for i in range(6)}, 3)
+
+        self.assertTrue(all(group.fallback_used for group in groups))
+        self.assertTrue(all(group.achieved_diversity is not None for group in groups))
+        self.assertTrue(any(
+            call.args[0] == "WARNING" and "global bridging fallback" in call.args[1]
+            for call in logged.call_args_list
+        ))
 
     def test_participant_embedding_failure_uses_random_fallback(self):
         service = TextMatchingService(
@@ -443,45 +755,11 @@ class TextMatchingServiceTests(unittest.TestCase):
             all(group.achieved_diversity is None for group in groups)
         )
         self.assertTrue(all(group.assigned_target is None for group in groups))
-        self.assertTrue(
-            all(
-                group.diffusion_statement == FALLBACK_STATEMENT
-                for group in groups
-            )
-        )
-
-    def test_statement_embedding_failure_preserves_optimized_groups(self):
-        participant_embeddings = np.eye(6)
-        service = TextMatchingService(
-            embedding_client=QueueEmbeddingClient(
-                [
-                    participant_embeddings,
-                    EmbeddingServiceError("offline"),
-                ]
-            ),
-            optimization_seconds=0,
-        )
-
-        groups = service.match(
-            {f"p{index}": f"response {index}" for index in range(6)},
-            3,
-        )
-
-        self.assertTrue(all(group.fallback_used for group in groups))
-        self.assertTrue(
-            all(group.diversity_level != "unknown" for group in groups)
-        )
-        # Only statement selection failed, so the optimized groups and all their
-        # diversity measurements survive.
-        self.assertTrue(
-            all(group.achieved_diversity is not None for group in groups)
-        )
-        self.assertTrue(
-            all(
-                group.diffusion_statement == FALLBACK_STATEMENT
-                for group in groups
-            )
-        )
+        # The committed ranking still supplies real comments for both slots.
+        for group in groups:
+            self.assertEqual(group.maximin_fallback_reason, "participant_embedding_failed")
+            self.assertTrue(group.diffusion_statement.startswith("Statement A: "))
+            self.assertNotIn(FALLBACK_STATEMENT, group.diffusion_statement)
 
 
 if __name__ == "__main__":

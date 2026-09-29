@@ -4,17 +4,29 @@ import hashlib
 import math
 import os
 import random
-import threading
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from itertools import combinations
 from typing import Literal, Protocol
 
 from logger import log
 import numpy as np
 
+from assignment import min_cost_assignment
+from bridging import pairwise_disagreement_scores
 from embedding_client import EmbeddingServiceError, HuggingFaceEmbeddingClient
+from presurvey import (
+    DIFFUSION_TOPIC_ID,
+    ApprovalMatrix,
+    CommentCatalog,
+    Link,
+    link_participants,
+    load_approval_matrix,
+    load_bridging_ranking,
+    load_comment_catalog,
+    load_eligible_comment_ids,
+)
 
 DiversityLevel = Literal["high", "medium", "low", "unknown"]
 FALLBACK_STATEMENT = "FALLBACK STATEMENT"
@@ -58,10 +70,10 @@ MEDIUM_ARM_WEIGHT = 2 ** 0.5
 # assignment by removing scatter rather than by shifting the mean.
 MIN_GROUPS_FOR_LEVELS = 3
 
-# Targets are pulled in from the achievable extremes by TARGET_PULL_IN of the
-# range. Targeting the exact floor or ceiling means the optimizer can only miss
-# inward, which makes assignment error one-sided; a symmetric margin keeps the
-# error roughly centered and the extreme arms reliably reachable.
+# Diagnostic only: each arm logs a margin of TARGET_PULL_IN of its achievable
+# floor-to-ceiling range. An earlier design pulled the endpoint targets in by
+# this margin; the endpoint arms now use minimax, which has no target, and the
+# medium target is the midpoint of the achieved endpoints. Nothing steers on it.
 TARGET_PULL_IN = 0.05
 
 # An arm is accepted when its restarts agree, not when it clears a fixed bound.
@@ -84,58 +96,24 @@ ENDPOINT_RESTARTS = 10
 DISTANCE_LOG_VALUES_PER_ENTRY = 6144
 DISTANCE_LOG_MAX_PARTICIPANTS = 500
 
-DUMMY_PARTICIPANT_STATEMENTS = (
-    "Public transit should be free in major cities.",
-    "Public transit fares are necessary to maintain reliable service.",
-    "Governments should introduce a universal basic income.",
-    "Employment programs are preferable to a universal basic income.",
-    "Social media platforms should face stricter content regulation.",
-    "People should have broad freedom to speak on social media platforms.",
-    "Cities should build substantially more dense housing.",
-    "Neighborhoods should retain local control over new housing development.",
-    "Carbon taxes are the best way to reduce emissions.",
-    "Climate policy should prioritize direct investment over carbon taxes.",
-    "University tuition should be publicly funded.",
-    "Students should contribute toward the cost of their university education.",
-    "Voting should be mandatory in national elections.",
-    "Voting should remain a voluntary civic choice.",
-    "Governments should place tighter restrictions on artificial intelligence.",
-    "Artificial intelligence should develop with minimal government restriction.",
-    "Healthcare should primarily be delivered through a public system.",
-    "Private healthcare options improve access and innovation.",
-    "Police budgets should shift toward community-based services.",
-    "Police departments need additional resources to improve public safety.",
-    "Immigration policy should make permanent residency easier to obtain.",
-    "Immigration levels should be reduced until infrastructure catches up.",
-    "Workers should have stronger legal protections for collective bargaining.",
-    "Labor policy should give employers greater flexibility in hiring.",
-)
-
-DIFFUSION_STATEMENTS = (
-    "Political compromise is usually more valuable than ideological consistency.",
-    "Local communities should have more authority than national governments.",
-    "Economic inequality is a greater threat than slow economic growth.",
-    "Public institutions should favor experimentation even when it creates risk.",
-    "Individual freedom should take priority over collective security.",
-    "Experts should have more influence over policy than public opinion.",
-    "Long-term environmental goals justify meaningful short-term costs.",
-    "Essential services should not be operated for profit.",
-    "Social stability sometimes requires limiting rapid political change.",
-    "Technology companies should be responsible for the social effects of their products.",
-    "Equal outcomes matter more than equal opportunities.",
-    "People have stronger obligations to their local community than to strangers.",
-    "Governments should act on uncertain risks before conclusive evidence is available.",
-    "Democratic decisions are legitimate even when they produce inefficient outcomes.",
-    "A healthy society should tolerate views that most people find offensive.",
-    "Economic policy should prioritize resilience over maximum efficiency.",
-    "Public policy should reward personal responsibility more than compensate for disadvantage.",
-    "Future generations should have formal representation in present-day decisions.",
-)
-
-
 class EmbeddingClient(Protocol):
     def embed(self, sentences: Sequence[str]) -> np.ndarray:
         ...
+
+
+@dataclass(frozen=True)
+class PreSurveyContext:
+    """What the pre-survey contributes to one run. Any part may be missing: a
+    failure here is logged and costs statement quality, never a table."""
+
+    catalog: CommentCatalog | None
+    matrix: ApprovalMatrix | None
+    links: dict[str, Link]
+    # Catalog rows of the diffusion topic's screened-eligible comments.
+    candidate_rows: tuple[int, ...] = ()
+    # The same comments ranked by bridging over the whole pre-survey: the
+    # fallback for any statement a table cannot compute.
+    fallback_rows: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -146,18 +124,25 @@ class TextMatchGroup:
     fallback_used: bool
     assigned_target: float | None
     achieved_diversity: float | None
+    # Why each statement fell back, if it did. Separates a routine per-table
+    # condition (fewer_than_two_linked) from an infrastructure failure
+    # (matrix_unavailable, participant_embedding_failed), which fallback_used
+    # alone cannot.
+    maximin_fallback_reason: str | None = None
+    bridging_fallback_reason: str | None = None
 
 
+@dataclass(frozen=True)
+class TableStatements:
+    text: str
+    maximin_fallback_reason: str | None
+    bridging_fallback_reason: str | None
+
+    @property
+    def fallback_used(self) -> bool:
+        return bool(self.maximin_fallback_reason or self.bridging_fallback_reason)
 
 
-def placeholder_responses(participant_ids: Sequence[str]) -> dict[str, str]:
-    ids = list(participant_ids)
-    pool = [
-        DUMMY_PARTICIPANT_STATEMENTS[index % len(DUMMY_PARTICIPANT_STATEMENTS)]
-        for index in range(len(ids))
-    ]
-    random.Random(_stable_seed(ids)).shuffle(pool)
-    return dict(zip(ids, pool))
 
 
 def plan_group_sizes(
@@ -215,6 +200,29 @@ def cosine_distance_matrix(embeddings: np.ndarray) -> np.ndarray:
     distances = 1.0 - similarities
     np.fill_diagonal(distances, 0.0)
     return distances
+
+
+def fill_missing_text_distances(
+    participant_ids: Sequence[str],
+    text_ids: Sequence[str],
+    text_distances: np.ndarray,
+) -> tuple[np.ndarray, float]:
+    """Everyone's distances, with no-text participants at the mean real distance.
+
+    Someone with no usable text has nothing to compare, and any stand-in
+    sentence has an opinion or a position in embedding space of its own. So
+    they are given the mean distance between the participants who do have
+    text, to everyone: wherever they are placed they add exactly average
+    diversity, and the pool mean, which every target is built on, is
+    unchanged. Returns the matrix and the fill value.
+    """
+    index = {pid: i for i, pid in enumerate(participant_ids)}
+    positions = [index[pid] for pid in text_ids]
+    fill = pool_mean_distance(text_distances)
+    distances = np.full((len(index), len(index)), fill)
+    distances[np.ix_(positions, positions)] = text_distances
+    np.fill_diagonal(distances, 0.0)
+    return distances, fill
 
 
 def pool_mean_distance(distances: np.ndarray) -> float:
@@ -686,12 +694,14 @@ def design_event(
 def _log_event_design(design: EventDesign, request=None) -> None:
     """Per-event structured log: geometry, arm status, doses, separation.
 
-    Doses are also reported on the calibrated Bradley-Terry axis,
-    arccos(1 - d) / pi, the predicted fraction of voters who would split on a
-    pair at distance d.
+    Doses are also reported as an angle fraction, arccos(1 - d) / pi: for unit
+    embeddings at cosine distance d, the angle between them as a share of 180
+    degrees. Equivalently, the chance that a random hyperplane through the
+    origin separates them. It is a monotone rescaling of d for readability,
+    not a calibrated model of voters.
     """
 
-    def bradley_terry(distance: float) -> float:
+    def angle_fraction(distance: float) -> float:
         return math.acos(max(-1.0, min(1.0, 1.0 - distance))) / math.pi
 
     arms_payload = []
@@ -705,7 +715,7 @@ def _log_event_design(design: EventDesign, request=None) -> None:
                 "target": arm.target,
                 "achieved": arm.achieved,
                 "achieved_mean": float(np.mean(arm.achieved)),
-                "achieved_mean_bt": bradley_terry(float(np.mean(arm.achieved))),
+                "achieved_mean_angle_fraction": angle_fraction(float(np.mean(arm.achieved))),
                 "floor": arm.floor,
                 "ceiling": arm.ceiling,
                 "margin": arm.margin,
@@ -762,19 +772,245 @@ def _log_event_design(design: EventDesign, request=None) -> None:
         )
 
 
-def select_diffusion_statement(
-    group_embeddings: np.ndarray,
-    statement_embeddings: np.ndarray,
-    statements: Sequence[str],
-) -> str:
-    group_matrix = _normalize_rows(group_embeddings)
-    statement_matrix = _normalize_rows(statement_embeddings)
-    if statement_matrix.shape[0] != len(statements):
-        raise ValueError("statement embedding count must match statement count")
+def maximin_scores(
+    member_embeddings: np.ndarray, candidate_embeddings: np.ndarray
+) -> np.ndarray:
+    """Each candidate's cosine distance to its closest group member.
 
-    distances = 1.0 - np.clip(group_matrix @ statement_matrix.T, -1.0, 1.0)
-    minimum_distances = distances.min(axis=0)
-    return list(statements)[int(np.argmax(minimum_distances))]
+    The pick is the candidate with the highest score: the comment furthest
+    from whoever at the table is nearest to it, so no one's own view is
+    simply echoed back.
+    """
+    members = _normalize_rows(member_embeddings)
+    candidates = _normalize_rows(candidate_embeddings)
+    if members.shape[1] != candidates.shape[1]:
+        raise ValueError(
+            f"member embeddings have {members.shape[1]} dimensions, "
+            f"candidates have {candidates.shape[1]}"
+        )
+    distances = 1.0 - np.clip(members @ candidates.T, -1.0, 1.0)
+    return distances.min(axis=0)
+
+
+@dataclass(frozen=True)
+class SlotPreferences:
+    """How one statement slot ranks the candidates, before the event-wide
+    assignment. scores and allowed are aligned with context.candidate_rows.
+    A slot whose method cannot run ranks by the global bridging order."""
+
+    table: int
+    method: Literal["maximin", "bridging"]
+    scores: np.ndarray
+    allowed: np.ndarray
+    fallback_reason: str | None = None
+    population_size: int | None = None
+    observed_share: float | None = None
+
+    def ranks(self) -> np.ndarray:
+        """0 for this slot's top choice among allowed candidates, and so on."""
+        order = np.argsort(-np.where(self.allowed, self.scores, -np.inf), kind="stable")
+        ranks = np.empty(len(order))
+        ranks[order] = np.arange(len(order))
+        return ranks
+
+
+@dataclass(frozen=True)
+class DiffusionChoice:
+    """One of a table's two statements, as assigned for the whole event.
+
+    rank is where the assigned comment sat in this slot's own preferences
+    (0 = its top choice); top_choice_* is what it would have picked alone.
+    score is the method's score for the assigned comment, or None when the
+    slot fell back to the global bridging order."""
+
+    method: Literal["maximin", "bridging"]
+    comment_id: str | None
+    text: str
+    score: float | None = None
+    rank: int | None = None
+    top_choice_id: str | None = None
+    top_choice_score: float | None = None
+    fallback_reason: str | None = None
+    population_size: int | None = None
+    observed_share: float | None = None
+
+
+def _clean(text: str) -> str:
+    """Collapse line breaks so a comment cannot break the A/B layout."""
+    return " ".join(text.split())
+
+
+def format_statements(first: str, second: str) -> str:
+    return f"Statement A: {first}\n\nStatement B: {second}"
+
+
+def table_preferences(
+    context: PreSurveyContext,
+    table: int,
+    member_ids: Sequence[str],
+    member_embeddings: np.ndarray | None,
+    missing_embeddings_reason: str = "participant_embedding_failed",
+) -> tuple[SlotPreferences, SlotPreferences]:
+    """The table's maximin and bridging preferences over the candidates.
+
+    A table's own comments (by members linked to the pre-survey) are not
+    allowed. A method that cannot run falls back to the global bridging order.
+    member_embeddings holds only members who wrote usable text; when there
+    are none, maximin falls back with missing_embeddings_reason.
+    """
+    catalog = context.catalog
+    candidates = context.candidate_rows
+    linked = [
+        context.links[pid] for pid in member_ids
+        if pid in context.links and context.links[pid].row is not None
+    ]
+    authors = {link.presurvey_pid for link in linked}
+    allowed = np.array(
+        [catalog.comments[row].author_pid not in authors for row in candidates], dtype=bool
+    )
+    position = {row: k for k, row in enumerate(context.fallback_rows)}
+    global_order = -np.array(
+        [position.get(row, len(position)) for row in candidates], dtype=np.float64
+    )
+
+    def fallback(method, reason):
+        return SlotPreferences(table, method, global_order, allowed, fallback_reason=reason)
+
+    if member_embeddings is None:
+        maximin = fallback("maximin", missing_embeddings_reason)
+    else:
+        try:
+            maximin = SlotPreferences(
+                table, "maximin",
+                maximin_scores(member_embeddings, catalog.embeddings[list(candidates)]),
+                allowed,
+            )
+        except ValueError as exc:
+            maximin = fallback("maximin", f"pick_failed: {exc}")
+
+    # Duplicate-row links (e.g. a shared email) count once in the population.
+    population = sorted({link.row for link in linked})
+    if context.matrix is None:
+        bridging = fallback("bridging", "matrix_unavailable")
+    elif len(population) < 2:
+        bridging = fallback("bridging", "fewer_than_two_linked")
+    else:
+        probabilities = context.matrix.probabilities[population]
+        bridging = SlotPreferences(
+            table, "bridging",
+            pairwise_disagreement_scores(probabilities, list(candidates)),
+            allowed,
+            population_size=len(population),
+            observed_share=float(np.mean((probabilities == 0) | (probabilities == 1))),
+        )
+    return maximin, bridging
+
+
+@dataclass(frozen=True)
+class EventAssignment:
+    choices: list[DiffusionChoice]
+    max_uses_per_comment: int
+    total_rank: int
+    collision_rounds: int
+    unresolved_collisions: int = 0
+
+
+def assign_statements(
+    context: PreSurveyContext, preferences: Sequence[SlotPreferences]
+) -> EventAssignment:
+    """Give every slot a comment, jointly for the whole event.
+
+    Each comment is used at most ceil(slots / candidates) times, so no two
+    tables share a statement until there are more slots than candidates, and
+    then as few comments as possible are reused: every reuse costs more than
+    any saving in rank could repay. Within that, the total rank lost across
+    slots is minimised, which weighs maximin and bridging equally despite
+    their different score scales.
+
+    A table must not show the same comment twice, which the assignment itself
+    cannot express once comments are reused. So after solving, a table that
+    got one comment in both slots has it ruled out for whichever slot ranks it
+    lower (or the other slot, if that is already ruled out), and the event is
+    solved again. Every round rules out at least one new pairing or stops, so
+    the loop always ends. A duplicate is the worst outcome, worse even than
+    showing a table its own comment: it removes the table's comparison. A
+    collision that nothing can resolve (a single candidate) is kept and
+    counted rather than retried forever.
+    """
+    catalog = context.catalog
+    candidates = context.candidate_rows
+    count = len(candidates)
+    uses = max(1, math.ceil(len(preferences) / count))
+    ranks = np.vstack([slot.ranks() for slot in preferences])
+    forbidden = ~np.vstack([slot.allowed for slot in preferences])
+
+    # Costs are lexicographic, each tier outweighing everything below it:
+    # a pairing ruled out to break a duplicate, then a table's own comment,
+    # then a reuse, then rank.
+    slots = len(preferences)
+    reuse_cost = slots * count + 1.0
+    own_cost = slots * (count + uses * reuse_cost) + 1.0
+    duplicate_cost = slots * own_cost * 2 + 1.0
+    ruled_out = np.zeros_like(forbidden)
+
+    rounds = 0
+    unresolved = 0
+    while True:
+        rounds += 1
+        cost = np.where(ruled_out, duplicate_cost, np.where(forbidden, own_cost, ranks))
+        picked = min_cost_assignment(
+            np.hstack([cost + copy * reuse_cost for copy in range(uses)])
+        ) % count
+        by_table: dict[int, list[int]] = {}
+        for index, slot in enumerate(preferences):
+            by_table.setdefault(slot.table, []).append(index)
+        collisions = [
+            slots for slots in by_table.values()
+            if len(slots) == 2 and picked[slots[0]] == picked[slots[1]]
+        ]
+        if not collisions:
+            break
+        progress = False
+        for first, second in collisions:
+            column = picked[first]
+            worse, better = (
+                (first, second) if ranks[first, column] > ranks[second, column]
+                else (second, first)
+            )
+            for slot in (worse, better):
+                if not ruled_out[slot, column]:
+                    ruled_out[slot, column] = True
+                    progress = True
+                    break
+        if not progress:
+            unresolved = len(collisions)
+            break
+
+    choices = []
+    for index, slot in enumerate(preferences):
+        column = int(picked[index])
+        top = int(np.argmin(np.where(slot.allowed, ranks[index], np.inf)))
+        comment = catalog.comments[candidates[column]]
+        computed = slot.fallback_reason is None
+        choices.append(DiffusionChoice(
+            method=slot.method,
+            comment_id=comment.comment_id,
+            text=_clean(comment.text),
+            score=float(slot.scores[column]) if computed else None,
+            rank=int(ranks[index, column]),
+            top_choice_id=catalog.comments[candidates[top]].comment_id,
+            top_choice_score=float(slot.scores[top]) if computed else None,
+            fallback_reason=slot.fallback_reason,
+            population_size=slot.population_size,
+            observed_share=slot.observed_share,
+        ))
+    return EventAssignment(
+        choices=choices,
+        max_uses_per_comment=uses,
+        total_rank=int(sum(choice.rank for choice in choices)),
+        collision_rounds=rounds - 1,
+        unresolved_collisions=unresolved,
+    )
 
 
 def _provenance(name: str) -> str | None:
@@ -792,14 +1028,12 @@ class TextMatchingService:
     def __init__(
         self,
         embedding_client: EmbeddingClient | None = None,
-        diffusion_statements: Sequence[str] = DIFFUSION_STATEMENTS,
         optimization_seconds: float = 30.0,
+        approval_matrix_uri: str | None = None,
     ):
         self.embedding_client = embedding_client or HuggingFaceEmbeddingClient()
-        self.diffusion_statements = tuple(diffusion_statements)
         self.optimization_seconds = optimization_seconds
-        self._diffusion_embeddings: np.ndarray | None = None
-        self._diffusion_lock = threading.Lock()
+        self.approval_matrix_uri = approval_matrix_uri
 
     @classmethod
     def from_environment(cls) -> "TextMatchingService":
@@ -808,15 +1042,23 @@ class TextMatchingService:
             optimization_seconds = min(240.0, max(0.0, float(raw_seconds)))
         except ValueError:
             optimization_seconds = 30.0
-        return cls(optimization_seconds=optimization_seconds)
+        return cls(
+            optimization_seconds=optimization_seconds,
+            approval_matrix_uri=_provenance("APPROVAL_MATRIX_URI"),
+        )
 
     def match(
         self,
-        participant_responses: dict[str, str],
+        participant_responses: dict[str, str | None],
         target_group_size: int,
         request=None,
+        identities: dict[str, tuple[str | None, str | None]] | None = None,
     ) -> list[TextMatchGroup]:
+        """participant_responses maps each id to their text, or None when they
+        gave none usable. identities maps each id to (email, name) for linking
+        to the pre-survey."""
         participant_ids = list(participant_responses)
+        text_ids = [pid for pid in participant_ids if participant_responses[pid]]
         group_sizes = plan_group_sizes(len(participant_ids), target_group_size)
         seed = _stable_seed(participant_ids)
         log.log_event("INFO", "Matching configuration", request, extra_data={
@@ -834,12 +1076,23 @@ class TextMatchingService:
             "code_revision": _provenance("MATCH_CODE_REVISION"),
             "embedding_model": _provenance("HF_MODEL_ID"),
             "embedding_model_revision": _provenance("HF_MODEL_REVISION"),
-            "diffusion_statements": list(self.diffusion_statements),
         })
+
+        if len(text_ids) < 2:
+            log.log_event(
+                "WARNING",
+                f"Only {len(text_ids)} participant(s) have usable text, so no "
+                f"distances exist; using random fallback",
+                request=request,
+                extra_data={"participant_count": len(participant_ids)},
+            )
+            return self._fallback_groups(
+                participant_ids, group_sizes, seed, identities or {}, request
+            )
 
         try:
             participant_embeddings = self.embedding_client.embed(
-                list(participant_responses.values())
+                [participant_responses[pid] for pid in text_ids]
             )
         except EmbeddingServiceError as exc:
             log.log_event(
@@ -848,12 +1101,17 @@ class TextMatchingService:
                 request=request,
                 extra_data={"participant_count": len(participant_ids)},
             )
-            return self._fallback_groups(participant_ids, group_sizes, seed)
+            return self._fallback_groups(
+                participant_ids, group_sizes, seed, identities or {}, request
+            )
 
         # Randomisation into condition pools happens here, after embedding, so a
         # REQUIRE_REAL_TEXT failure aborts before anyone is assigned, and before
         # any distance-based decision is taken.
-        distances = cosine_distance_matrix(participant_embeddings)
+        missing_text_ids = [pid for pid in participant_ids if not participant_responses[pid]]
+        distances, fill = fill_missing_text_distances(
+            participant_ids, text_ids, cosine_distance_matrix(participant_embeddings)
+        )
         participant_count = len(participant_ids)
         entry_count = 0
         rows_logged = participant_count <= DISTANCE_LOG_MAX_PARTICIPANTS
@@ -882,6 +1140,8 @@ class TextMatchingService:
         log.log_event("INFO", "Participant distances complete", request, extra_data={
             "participant_count": participant_count,
             "embedding_dimensions": int(participant_embeddings.shape[1]),
+            "missing_text_participant_ids": missing_text_ids,
+            "missing_text_fill_distance": fill if missing_text_ids else None,
             "rows_logged": rows_logged,
             "entry_count": entry_count,
             "max_participants": DISTANCE_LOG_MAX_PARTICIPANTS,
@@ -898,74 +1158,263 @@ class TextMatchingService:
         )
         _log_event_design(design, request)
 
+        # Groups are final from here on. Nothing below may change or fail them.
         embedding_by_id = {
             participant_id: participant_embeddings[index]
-            for index, participant_id in enumerate(participant_ids)
+            for index, participant_id in enumerate(text_ids)
         }
-        flat = [
+        placed = [
             (arm, group, achieved)
             for arm in design.arms
             for group, achieved in zip(arm.groups, arm.achieved)
         ]
+        statements = self._diffusion_statements(
+            [group for _, group, _ in placed],
+            [arm.level for arm, _, _ in placed],
+            embedding_by_id, identities or {}, seed, request,
+        )
+        return [
+            self._build_group(arm, group, achieved, statement)
+            for (arm, group, achieved), statement in zip(placed, statements)
+        ]
 
-        try:
-            diffusion_embeddings = self._get_diffusion_embeddings()
-        except EmbeddingServiceError as exc:
+    def _diffusion_statements(
+        self,
+        groups: list[list[str]],
+        levels: list[str],
+        embedding_by_id: dict[str, np.ndarray] | None,
+        identities: dict[str, tuple[str | None, str | None]],
+        seed: int,
+        request=None,
+    ) -> list[TableStatements]:
+        """Each group's "Statement A / Statement B" text and why each slot
+        fell back, if it did. Statements are assigned jointly across the event so
+        tables do not share them; which method fills slot A is randomised
+        per group."""
+        context = self._load_presurvey(identities, request)
+        if context.catalog is None or not context.candidate_rows:
+            reason = "catalog_unavailable" if context.catalog is None else "no_candidates"
+            log.log_event(
+                "ERROR", f"No diffusion candidates ({reason}); using the fallback text", request,
+            )
+            text = format_statements(FALLBACK_STATEMENT, FALLBACK_STATEMENT)
+            return [TableStatements(text, reason, reason) for _ in groups]
+
+        def member_embeddings(group):
+            """Embeddings of members with usable text, and why there are none."""
+            if embedding_by_id is None:
+                return None, "participant_embedding_failed"
+            rows = [embedding_by_id[pid] for pid in group if pid in embedding_by_id]
+            return (np.vstack(rows), None) if rows else (None, "no_member_text")
+
+        preferences = []
+        for table, group in enumerate(groups):
+            embeddings, reason = member_embeddings(group)
+            preferences.extend(table_preferences(
+                context, table, group, embeddings,
+                **({"missing_embeddings_reason": reason} if reason else {}),
+            ))
+        assignment = assign_statements(context, preferences)
+
+        order_rng = random.Random(seed ^ 0xAB0DE)
+        results = []
+        records = []
+        for table, (group, level) in enumerate(zip(groups, levels)):
+            maximin, bridging = assignment.choices[2 * table], assignment.choices[2 * table + 1]
+            maximin_first = order_rng.random() < 0.5
+            first, second = (maximin, bridging) if maximin_first else (bridging, maximin)
+            results.append(TableStatements(
+                format_statements(first.text, second.text),
+                maximin.fallback_reason,
+                bridging.fallback_reason,
+            ))
+            records.append({
+                "participant_ids": group,
+                "diversity_level": level,
+                "slot_a_method": first.method,
+                "maximin": asdict(maximin),
+                "bridging": asdict(bridging),
+            })
+
+        log.log_event("INFO", "Diffusion picks", request, extra_data={
+            "candidate_count": len(context.candidate_rows),
+            "slot_count": len(preferences),
+            "max_uses_per_comment": assignment.max_uses_per_comment,
+            "total_rank": assignment.total_rank,
+            "collision_rounds": assignment.collision_rounds,
+            "unresolved_collisions": assignment.unresolved_collisions,
+            "maximin_fallback_count": sum(1 for r in records if r["maximin"]["fallback_reason"]),
+            "bridging_fallback_count": sum(1 for r in records if r["bridging"]["fallback_reason"]),
+            "groups": records,
+        })
+        if assignment.unresolved_collisions:
             log.log_event(
                 "WARNING",
-                f"Diffusion statement embedding failed; using fallback statement: {exc}",
-                request=request,
+                f"{assignment.unresolved_collisions} table(s) show the same comment in "
+                f"both slots: no other candidate was available to them",
+                request,
             )
-            return [
-                self._build_group(arm, group, achieved, FALLBACK_STATEMENT, True)
-                for arm, group, achieved in flat
-            ]
-
-        results = []
-        for arm, group, achieved in flat:
-            group_embeddings = np.vstack(
-                [embedding_by_id[participant_id] for participant_id in group]
-            )
-            statement = select_diffusion_statement(
-                group_embeddings,
-                diffusion_embeddings,
-                self.diffusion_statements,
-            )
-            results.append(
-                self._build_group(arm, group, achieved, statement, False)
+        reasons = sorted({
+            record[method]["fallback_reason"]
+            for record in records for method in ("maximin", "bridging")
+            if record[method]["fallback_reason"]
+        })
+        if reasons:
+            log.log_event(
+                "WARNING",
+                "Some diffusion statements came from the global bridging fallback",
+                request,
+                extra_data={"reasons": reasons},
             )
         return results
+
+    def _load_presurvey(
+        self,
+        identities: dict[str, tuple[str | None, str | None]],
+        request=None,
+    ) -> PreSurveyContext:
+        try:
+            catalog = load_comment_catalog()
+        except Exception as exc:
+            # The catalog ships with the code, so this is a broken deployment.
+            log.log_event(
+                "ERROR", f"Pre-survey comment catalog failed to load: {exc}", request,
+            )
+            return PreSurveyContext(catalog=None, matrix=None, links={})
+
+        # Loaded on its own so a failure names the right file. With no screen
+        # there are no candidates: unscreened comments are never shown.
+        try:
+            eligible = load_eligible_comment_ids()
+        except Exception as exc:
+            log.log_event(
+                "ERROR", f"Diffusion eligibility screen failed to load: {exc}", request,
+            )
+            eligible = frozenset()
+
+        candidate_rows = tuple(
+            row for row, comment in enumerate(catalog.comments)
+            if comment.topic_id == DIFFUSION_TOPIC_ID and comment.comment_id in eligible
+        )
+        # The ranking only orders fallbacks, so losing it must not cost the
+        # statements every table can compute for itself.
+        try:
+            ranking = load_bridging_ranking()
+        except Exception as exc:
+            log.log_event(
+                "ERROR",
+                f"Global bridging ranking failed to load; fallback statements "
+                f"will be in catalog order: {exc}",
+                request,
+            )
+            ranking = ()
+        row_of = {comment.comment_id: row for row, comment in enumerate(catalog.comments)}
+        fallback_rows = tuple(row_of[cid] for cid in ranking if row_of.get(cid) in candidate_rows)
+        matrix = None
+        matrix_error = None
+        if not self.approval_matrix_uri:
+            matrix_error = "APPROVAL_MATRIX_URI is not set"
+        else:
+            try:
+                matrix = load_approval_matrix(self.approval_matrix_uri, catalog)
+            except Exception as exc:
+                matrix_error = f"{type(exc).__name__}: {exc}"
+
+        log.log_event("INFO", "Pre-survey data", request, extra_data={
+            "diffusion_topic_id": DIFFUSION_TOPIC_ID,
+            "catalog_sha256": catalog.sha256,
+            "catalog_comment_count": len(catalog.comments),
+            "catalog_topic_counts": catalog.topic_counts(),
+            "catalog_embedding_model": catalog.embedding_model,
+            "catalog_embedding_revision": catalog.embedding_revision,
+            "diffusion_candidate_count": len(candidate_rows),
+            "matrix_source": self.approval_matrix_uri,
+            "matrix_loaded": matrix is not None,
+            "matrix_error": matrix_error,
+            "matrix_sha256": matrix.sha256 if matrix else None,
+            "matrix_voter_count": len(matrix.pids) if matrix else None,
+            "matrix_observed_share": matrix.observed_share if matrix else None,
+        })
+        # Catalog embeddings are only comparable with registration embeddings
+        # from the same model. Checked only where the deployment records one.
+        for field, deployed in (
+            ("model", _provenance("HF_MODEL_ID")),
+            ("revision", _provenance("HF_MODEL_REVISION")),
+        ):
+            recorded = getattr(catalog, f"embedding_{field}")
+            if deployed and recorded and deployed != recorded:
+                log.log_event(
+                    "WARNING",
+                    f"Catalog embedding {field} '{recorded}' differs from the "
+                    f"deployed '{deployed}'; comment distances are not comparable",
+                    request,
+                )
+        if matrix is None:
+            log.log_event(
+                "WARNING",
+                f"Approval matrix unavailable; nobody can be linked: {matrix_error}",
+                request,
+            )
+            return PreSurveyContext(
+                catalog=catalog, matrix=None, links={}, candidate_rows=candidate_rows,
+                fallback_rows=fallback_rows,
+            )
+
+        links = link_participants(identities, matrix)
+        counts = {"email": 0, "name": 0, "none": 0}
+        rows: dict[str, list[str]] = {}
+        for link in links.values():
+            counts[link.method] += 1
+            if link.presurvey_pid:
+                rows.setdefault(link.presurvey_pid, []).append(link.participant_id)
+        log.log_event("INFO", "Pre-survey linking", request, extra_data={
+            "link_counts": counts,
+            "links": [
+                {
+                    "participant_id": pid,
+                    "email": identities[pid][0],
+                    "name": identities[pid][1],
+                    "link_method": link.method,
+                    "presurvey_pid": link.presurvey_pid,
+                }
+                for pid, link in links.items()
+            ],
+            # One pre-survey row claimed by several registrants, e.g. a shared
+            # household email. Kept, but visible.
+            "shared_presurvey_rows": {
+                pid: ids for pid, ids in rows.items() if len(ids) > 1
+            },
+        })
+        return PreSurveyContext(
+            catalog=catalog, matrix=matrix, links=links, candidate_rows=candidate_rows,
+            fallback_rows=fallback_rows,
+        )
 
     @staticmethod
     def _build_group(
         arm: ArmDesign,
         group: list[str],
         achieved: float,
-        diffusion_statement: str,
-        fallback_used: bool,
+        statements: TableStatements,
     ) -> TextMatchGroup:
         return TextMatchGroup(
             participant_ids=group,
             diversity_level=arm.level,
-            diffusion_statement=diffusion_statement,
-            fallback_used=fallback_used,
+            diffusion_statement=statements.text,
+            fallback_used=statements.fallback_used,
             assigned_target=arm.target,
             achieved_diversity=achieved,
+            maximin_fallback_reason=statements.maximin_fallback_reason,
+            bridging_fallback_reason=statements.bridging_fallback_reason,
         )
-
-    def _get_diffusion_embeddings(self) -> np.ndarray:
-        with self._diffusion_lock:
-            if self._diffusion_embeddings is None:
-                self._diffusion_embeddings = self.embedding_client.embed(
-                    self.diffusion_statements
-                )
-            return self._diffusion_embeddings
 
     def _fallback_groups(
         self,
         participant_ids: list[str],
         group_sizes: list[int],
         seed: int,
+        identities: dict[str, tuple[str | None, str | None]],
+        request=None,
     ) -> list[TextMatchGroup]:
         # TODO: Design a more elegant fallback strategy than random assignment.
         # Without embeddings there is no distance matrix, so no target can be
@@ -973,16 +1422,22 @@ class TextMatchingService:
         shuffled = participant_ids[:]
         random.Random(seed).shuffle(shuffled)
         groups = _allocate_indices(shuffled, group_sizes)
+        # Bridging needs no embeddings, so it can still run; maximin falls back.
+        statements = self._diffusion_statements(
+            groups, ["unknown"] * len(groups), None, identities, seed, request,
+        )
         return [
             TextMatchGroup(
                 participant_ids=group,
                 diversity_level="unknown",
-                diffusion_statement=FALLBACK_STATEMENT,
+                diffusion_statement=statement.text,
                 fallback_used=True,
                 assigned_target=None,
                 achieved_diversity=None,
+                maximin_fallback_reason=statement.maximin_fallback_reason,
+                bridging_fallback_reason=statement.bridging_fallback_reason,
             )
-            for group in groups
+            for group, statement in zip(groups, statements)
         ]
 
 

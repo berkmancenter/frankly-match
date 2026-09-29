@@ -83,11 +83,9 @@ paths:
 
         The response carries only what a client renders: groupId, participantIds, diversityLevel and diffusionStatement. Every diagnostic is logged rather than returned - assignedTarget, achievedDiversity, pool geometry, feasible bounds per arm, achieved endpoint means, the medium target, arm-overlap gaps, per-arm restart convergence, and the embedded text per participant.
 
-        diversityLevel reports which arm a group was randomized into and is the regressor for analysis. If embedding fails, the API returns size-preserving random groups with diversityLevel "unknown" and the fallback diffusion statement; the failure is logged as a WARNING.
+        diversityLevel reports which arm a group was randomized into and is the regressor for analysis. If embedding fails, the API returns size-preserving random groups with diversityLevel "unknown"; their diffusion statements come from the global bridging fallback, and the failure is logged as a WARNING.
 
-        With REQUIRE_REAL_TEXT set, a participant missing freeTextResponse causes a 422 MISSING_TEXT_RESPONSES listing the affected ids, rather than silent placeholder substitution.
-
-        Until freeTextResponse is supplied by the upstream survey payload, missing text responses receive deterministic development placeholders.
+        A participant with a missing or whitespace-only freeTextResponse is still matched, placed at the mean distance between participants who wrote text. With REQUIRE_REAL_TEXT set, such a participant instead causes a 422 MISSING_TEXT_RESPONSES listing the affected ids.
 
         Optional studyId and eventId link matching logs to study records. The X-Match-Run-ID response header identifies this attempt and is present on every response, including 400/422 validation failures and 500 errors; save it with the groups actually used. Group IDs are unique only within a run.
       tags: [Matching]
@@ -112,11 +110,11 @@ paths:
                 - groupId: "1"
                   participantIds: ["uid_alice", "uid_dave", "uid_eve"]
                   diversityLevel: high
-                  diffusionStatement: "Political compromise is usually more valuable than ideological consistency."
+                  diffusionStatement: "Statement A: More farmer market locations.\n\nStatement B: Pay people to grow their own food"
                 - groupId: "2"
                   participantIds: ["uid_bob", "uid_carol", "uid_frank"]
                   diversityLevel: medium
-                  diffusionStatement: "Future generations should have formal representation in present-day decisions."
+                  diffusionStatement: "Statement A: Hydrogrowing and wall growing options\n\nStatement B: Open grocery stores in food desert neighborhoods."
         "400":
           $ref: "#/responses/BadRequest"
         "422":
@@ -180,7 +178,7 @@ definitions:
     description: |
       Per-participant survey data. The selected algorithm determines which field it reads.
 
-      freeTextResponse is temporarily optional for textGroupMatch while the upstream survey payload is being extended. Missing values receive deterministic placeholders.
+      freeTextResponse is optional for textGroupMatch; a participant without it is matched at the average distance from everyone.
     properties:
       binaryAnswerMask:
         type: string
@@ -195,8 +193,18 @@ definitions:
         type: string
         minLength: 1
         description: |
-          Free-form survey response embedded by textGroupMatch. Whitespace-only or missing values currently receive a development placeholder.
+          Free-form survey response embedded by textGroupMatch. Whitespace-only or missing values count as no text.
         example: "Public transit should be free in major cities."
+      email:
+        type: string
+        description: |
+          Participant email, used by textGroupMatch to link the participant to their pre-survey entry. Optional; not format-checked. Surrounding whitespace is trimmed and a blank value is treated as absent. A participant who cannot be linked is still matched.
+        example: "alice@example.org"
+      name:
+        type: string
+        description: |
+          Participant display name, used by textGroupMatch as a fallback link to the pre-survey when the email does not match. Optional; trimmed, and blank is treated as absent.
+        example: "Alice Example"
     additionalProperties: true
 
   MatchResponse:
@@ -238,7 +246,7 @@ definitions:
       diffusionStatement:
         type: string
         description: |
-          Statement selected to be distant from every group member using a maximin cosine-distance rule. FALLBACK STATEMENT is returned when statement selection is unavailable.
+          Two pre-survey comments on the diffusion topic, formatted as "Statement A: <comment>\n\nStatement B: <comment>". One is chosen for distance (by cosine distance) from the group's nearest member, the other for how bridging the group's linked pre-survey voters find it. Comments are assigned across all groups jointly, so groups do not share a statement until there are more statements than candidates. Which fills slot A is randomized per group. A ranking that cannot be computed uses a precomputed global bridging ranking.
     additionalProperties: true
 
   HealthResponse:

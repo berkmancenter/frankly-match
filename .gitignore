@@ -2,3 +2,6 @@
 
 # Patch files applied via git am; the commits are the record
 *.patch
+
+# Pre-survey approval matrices carry participant names and emails
+approval_matrix*.csv

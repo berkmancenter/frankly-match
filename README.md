@@ -52,11 +52,20 @@ which minimax cannot match when every group in the arm must clear the bar
 simultaneously. Restarts converging on the same value is the evidence that an arm
 sits at its pool's real limit rather than being stuck.
 
-Each text-matched group also receives a reusable `diffusionStatement`. The selected statement maximizes its minimum cosine distance from any member of the group.
+Each text-matched group also receives a `diffusionStatement`: a comment from the pre-survey on the diffusion topic (`stocking_growing`), chosen from those an offline LLM screen marked eligible in `api/data/diffusion_eligibility.json` (see `api/scripts/judge_diffusion_comments.py`). Comments written by anyone at the table who links to the pre-survey are skipped. The statement has two parts, returned as `Statement A: …` and `Statement B: …` separated by a blank line, with the order randomized per table:
 
-## Text Response Transition
+- **Maximin** ranks candidates by their cosine distance to the table's nearest member, largest first.
+- **Bridging** ranks them by probabilistic pairwise-disagreement score (`api/bridging.py`), with the table's linked pre-survey voters as the population. It needs at least two linked voters.
 
-`freeTextResponse` is defined in the API contract but is not yet guaranteed by the upstream survey payload. During this transition, missing text responses receive deterministic development placeholders. The replacement point is marked with a TODO in `api/main.py`.
+A ranking that cannot be computed (no approval matrix, fewer than two linked voters, failed embeddings) uses `api/data/bridging_ranking.json` instead: the same bridging score computed offline over every pre-survey voter (`api/scripts/rank_global_bridging.py`).
+
+Comments are then assigned to every table's two slots jointly (`assign_statements`, solved with the Hungarian algorithm in `api/assignment.py`). Tables do not share a comment until there are more slots than candidates, and then as few comments as possible are reused, never twice at one table. Within that, the total rank lost across all slots is minimised, so a table often gets its second or third choice rather than a comment another table needs more. Each slot's log records the rank it received and the top choice it gave up.
+
+## Participants Without Text
+
+A participant whose `freeTextResponse` is missing or only whitespace is still matched, but nothing is invented for them: any stand-in sentence would carry an opinion and a position in embedding space of its own. Instead they are placed at the mean distance between the participants who did write text, to everyone, so they add exactly average diversity wherever they sit and the pool mean is unchanged. They are left out of the maximin pick; a table where nobody wrote text takes that statement from the global bridging fallback (`no_member_text`). With fewer than two usable texts no distances exist and the groups are random. These participants are listed in `missing_text_participant_ids`.
+
+`REQUIRE_REAL_TEXT=1` refuses the whole request instead (422 `MISSING_TEXT_RESPONSES`). Frankly then falls back to its own matching for everyone, so leave it off for live events.
 
 ## Local API
 
@@ -114,8 +123,8 @@ go to Google Cloud Logging instead (see Logging below).
 
 Every `/match` call emits structured entries through `api/logger.py`:
 
-- the embedded text per participant, flagged where a placeholder was
-  substituted.
+- the embedded text per participant, with `has_text` false where none was
+  usable.
 - the resulting groups with assigned target, achieved diversity, diffusion
   statement and fallback flag.
 - a group-size report comparing produced groups against `plan_group_sizes`,
@@ -124,15 +133,17 @@ Every `/match` call emits structured entries through `api/logger.py`:
   count, plus `condition_counts` giving the number of groups in each arm.
 - an `arms` payload, one entry per diversity arm: `level`, `groups`, `people`,
   `sizes`, `target` (medium only), `achieved` and `achieved_mean`, the
-  achievable `floor`/`ceiling`/`margin` for that pool, and the optimizer's
+  achievable `floor`/`ceiling` for that pool with a diagnostic `margin` (5% of
+  that range; nothing steers on it), and the optimizer's
   status as `restarts_used`, `restart_statistics`, `restart_spread`,
   `converged` and `deadline_bound`.
 - per-event geometry: `pool_mean`, the achieved `endpoint_low` and
   `endpoint_high`, the derived `medium_target`, and `arms_separated` with the
   `low_to_medium_gap` and `medium_to_high_gap`.
-- doses on the calibrated Bradley-Terry axis as `achieved_mean_bt`,
-  `arccos(1 - d) / pi` -- the predicted fraction of voters who would split on a
-  pair at distance `d`.
+- doses as `achieved_mean_angle_fraction`, `arccos(1 - d) / pi` of the arm's
+  mean distance `d`: the angle between two unit embeddings at that distance as
+  a share of 180 degrees. A monotone rescaling for readability, not a
+  calibrated voter model.
 
 Groups are allocated to diversity arms as `sqrt(2) : 1 : 1`
 (medium : low : high) -- 6 / 8 / 6 at 20 groups, 7 / 11 / 7 at 25. This is a
@@ -194,9 +205,12 @@ logged, `rows_logged` is false on the completion record, and only the checksum
 remains. A durable per-run export (for example one GCS object per run ID) is
 the right long-term home for this matrix and is not part of this change.
 
-Group logs distinguish `participant_embedding_failed` from
-`statement_embedding_failed` in `fallbackReason`. Successful matching has a null
-reason. On Cloud Logging failure, the same structured payload is serialized as
+Group logs set `fallbackReason` to `participant_embedding_failed` only when the
+group itself is a random fallback. Why each statement fell back is in
+`maximinFallbackReason` and `bridgingFallbackReason`, which separate routine
+per-table cases (`fewer_than_two_linked`) from infrastructure failures
+(`matrix_unavailable`, `participant_embedding_failed`). All three are null when
+nothing fell back. On Cloud Logging failure, the same structured payload is serialized as
 JSON in the stderr log message, and the failure diagnostic itself is a
 structured record carrying the same run ID and schema version. Logging remains
 best-effort and is not a durable archive or a transaction. A completion marker alone does not prove all writes
