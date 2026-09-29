@@ -29,6 +29,8 @@ from typing import Literal
 
 import numpy as np
 
+from logger import log
+
 # The registration question whose answers pick the diffusion comment, and the
 # topic the comment is drawn from.
 DIFFUSION_TOPIC_ID = "stocking_growing"
@@ -300,9 +302,17 @@ def _download_gcs(bucket: str, blob: str) -> bytes:
                 .blob(blob)
                 .download_as_bytes(timeout=GCS_TIMEOUT_SECONDS, retry=None)
             )
-        except Exception:
+        except Exception as exc:
             if attempt == GCS_ATTEMPTS - 1:
                 raise
+            # A retry that succeeds would otherwise leave no trace that GCS
+            # is degraded. The request's log context still applies here.
+            log.log_event(
+                "WARNING",
+                f"GCS download of gs://{bucket}/{blob} failed on attempt "
+                f"{attempt + 1}/{GCS_ATTEMPTS}, retrying: {type(exc).__name__}: {exc}",
+                None,
+            )
 
 
 def load_approval_matrix(uri: str, catalog: CommentCatalog) -> ApprovalMatrix:

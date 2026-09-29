@@ -193,14 +193,22 @@ class GcsDownloadTests(unittest.TestCase):
 
     def test_the_library_retry_is_off_and_each_attempt_is_bounded(self):
         module, calls = self._storage([b"data"])
-        with patch.dict(sys.modules, {"google.cloud.storage": module}):
+        with patch.dict(sys.modules, {"google.cloud.storage": module}), \
+                patch("presurvey.log.log_event") as logged:
             self.assertEqual(presurvey._download_gcs("b", "o"), b"data")
+        logged.assert_not_called()
         self.assertEqual(calls, [{"timeout": presurvey.GCS_TIMEOUT_SECONDS, "retry": None}])
 
     def test_one_transient_failure_is_retried_then_it_gives_up(self):
         module, calls = self._storage([ConnectionError("reset"), b"data"])
-        with patch.dict(sys.modules, {"google.cloud.storage": module}):
+        with patch.dict(sys.modules, {"google.cloud.storage": module}), \
+                patch("presurvey.log.log_event") as logged:
             self.assertEqual(presurvey._download_gcs("b", "o"), b"data")
+        # The retried failure leaves a trace even though the read succeeded.
+        (warning,) = logged.call_args_list
+        self.assertEqual(warning.args[0], "WARNING")
+        self.assertIn("attempt 1/2", warning.args[1])
+        self.assertIn("ConnectionError: reset", warning.args[1])
         presurvey._gcs_client.cache_clear()
         module, calls = self._storage([TimeoutError("slow")] * presurvey.GCS_ATTEMPTS)
         with patch.dict(sys.modules, {"google.cloud.storage": module}), \
