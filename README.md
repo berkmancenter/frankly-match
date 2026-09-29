@@ -203,9 +203,12 @@ logged, `rows_logged` is false on the completion record, and only the checksum
 remains. A durable per-run export (for example one GCS object per run ID) is
 the right long-term home for this matrix and is not part of this change.
 
-Group logs distinguish `participant_embedding_failed` from
-`diffusion_fallback_used` in `fallbackReason`; the "Diffusion picks" record gives the specific reason for each statement. Successful matching has a null
-reason. On Cloud Logging failure, the same structured payload is serialized as
+Group logs set `fallbackReason` to `participant_embedding_failed` only when the
+group itself is a random fallback. Why each statement fell back is in
+`maximinFallbackReason` and `bridgingFallbackReason`, which separate routine
+per-table cases (`fewer_than_two_linked`) from infrastructure failures
+(`matrix_unavailable`, `participant_embedding_failed`). All three are null when
+nothing fell back. On Cloud Logging failure, the same structured payload is serialized as
 JSON in the stderr log message, and the failure diagnostic itself is a
 structured record carrying the same run ID and schema version. Logging remains
 best-effort and is not a durable archive or a transaction. A completion marker alone does not prove all writes

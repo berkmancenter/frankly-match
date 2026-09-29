@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -264,6 +265,43 @@ class MatchApiTests(unittest.TestCase):
         self.assertIsNone(by_id["b"]["name"])
         self.assertIsNone(by_id["c"]["email"])
         self.assertIsNone(by_id["c"]["name"])
+
+    def test_per_statement_fallback_reasons_are_logged_not_returned(self):
+        """A routine per-table fallback is logged as such, not as a
+        group-level failure, and nothing extra reaches the client."""
+        service = FakeTextMatchingService()
+        original = service.match
+
+        def match(*args, **kwargs):
+            (group,) = original(*args, **kwargs)
+            return [replace(group, fallback_used=True,
+                            bridging_fallback_reason="fewer_than_two_linked")]
+
+        service.match = match
+        with patch.object(
+            main, "get_text_matching_service", return_value=service
+        ), patch.object(main.log, "log_event") as log_event:
+            response = self.client.post(
+                "/match",
+                json={
+                    "algorithm": "textGroupMatch",
+                    "targetGroupSize": 3,
+                    "participants": {"a": {}, "b": {}, "c": {}},
+                },
+            )
+
+        body = response.json()["results"][0]
+        for field in ("fallbackReason", "maximinFallbackReason", "bridgingFallbackReason"):
+            self.assertNotIn(field, body)
+        logged_group = next(
+            call.kwargs["extra_data"]["groups"][0]
+            for call in log_event.call_args_list
+            if call.kwargs.get("extra_data", {}).get("algorithm") == "textGroupMatch"
+        )
+        self.assertTrue(logged_group["fallbackUsed"])
+        self.assertIsNone(logged_group["fallbackReason"])
+        self.assertIsNone(logged_group["maximinFallbackReason"])
+        self.assertEqual(logged_group["bridgingFallbackReason"], "fewer_than_two_linked")
 
     def test_text_diagnostics_go_to_the_logger(self):
         service = FakeTextMatchingService()

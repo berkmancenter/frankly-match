@@ -593,6 +593,9 @@ class TextMatchingServiceTests(unittest.TestCase):
                 group.diffusion_statement,
                 format_statements(first, logged_group[second_method]["text"]),
             )
+        for group in groups:
+            self.assertIsNone(group.maximin_fallback_reason)
+            self.assertEqual(group.bridging_fallback_reason, "matrix_unavailable")
         # The order is randomised per group, and reproducible from the seed.
         self.assertEqual(len({g["slot_a_method"] for g in record["groups"]}), 2)
 
@@ -688,6 +691,7 @@ class TextMatchingServiceTests(unittest.TestCase):
         self.assertTrue(all(group.assigned_target is None for group in groups))
         # The committed ranking still supplies real comments for both slots.
         for group in groups:
+            self.assertEqual(group.maximin_fallback_reason, "participant_embedding_failed")
             self.assertTrue(group.diffusion_statement.startswith("Statement A: "))
             self.assertNotIn(FALLBACK_STATEMENT, group.diffusion_statement)
 

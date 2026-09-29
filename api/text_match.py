@@ -151,6 +151,23 @@ class TextMatchGroup:
     fallback_used: bool
     assigned_target: float | None
     achieved_diversity: float | None
+    # Why each statement fell back, if it did. Separates a routine per-table
+    # condition (fewer_than_two_linked) from an infrastructure failure
+    # (matrix_unavailable, participant_embedding_failed), which fallback_used
+    # alone cannot.
+    maximin_fallback_reason: str | None = None
+    bridging_fallback_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class TableStatements:
+    text: str
+    maximin_fallback_reason: str | None
+    bridging_fallback_reason: str | None
+
+    @property
+    def fallback_used(self) -> bool:
+        return bool(self.maximin_fallback_reason or self.bridging_fallback_reason)
 
 
 
@@ -1148,8 +1165,8 @@ class TextMatchingService:
             embedding_by_id, identities or {}, seed, request,
         )
         return [
-            self._build_group(arm, group, achieved, statement, fallback_used)
-            for (arm, group, achieved), (statement, fallback_used) in zip(placed, statements)
+            self._build_group(arm, group, achieved, statement)
+            for (arm, group, achieved), statement in zip(placed, statements)
         ]
 
     def _diffusion_statements(
@@ -1160,9 +1177,9 @@ class TextMatchingService:
         identities: dict[str, tuple[str | None, str | None]],
         seed: int,
         request=None,
-    ) -> list[tuple[str, bool]]:
-        """Each group's "Statement A / Statement B" text and whether either
-        slot fell back. Statements are assigned jointly across the event so
+    ) -> list[TableStatements]:
+        """Each group's "Statement A / Statement B" text and why each slot
+        fell back, if it did. Statements are assigned jointly across the event so
         tables do not share them; which method fills slot A is randomised
         per group."""
         context = self._load_presurvey(identities, request)
@@ -1172,7 +1189,7 @@ class TextMatchingService:
                 "ERROR", f"No diffusion candidates ({reason}); using the fallback text", request,
             )
             text = format_statements(FALLBACK_STATEMENT, FALLBACK_STATEMENT)
-            return [(text, True) for _ in groups]
+            return [TableStatements(text, reason, reason) for _ in groups]
 
         preferences = [
             slot
@@ -1194,8 +1211,11 @@ class TextMatchingService:
             maximin, bridging = assignment.choices[2 * table], assignment.choices[2 * table + 1]
             maximin_first = order_rng.random() < 0.5
             first, second = (maximin, bridging) if maximin_first else (bridging, maximin)
-            fell_back = bool(maximin.fallback_reason or bridging.fallback_reason)
-            results.append((format_statements(first.text, second.text), fell_back))
+            results.append(TableStatements(
+                format_statements(first.text, second.text),
+                maximin.fallback_reason,
+                bridging.fallback_reason,
+            ))
             records.append({
                 "participant_ids": group,
                 "diversity_level": level,
@@ -1363,16 +1383,17 @@ class TextMatchingService:
         arm: ArmDesign,
         group: list[str],
         achieved: float,
-        diffusion_statement: str,
-        fallback_used: bool,
+        statements: TableStatements,
     ) -> TextMatchGroup:
         return TextMatchGroup(
             participant_ids=group,
             diversity_level=arm.level,
-            diffusion_statement=diffusion_statement,
-            fallback_used=fallback_used,
+            diffusion_statement=statements.text,
+            fallback_used=statements.fallback_used,
             assigned_target=arm.target,
             achieved_diversity=achieved,
+            maximin_fallback_reason=statements.maximin_fallback_reason,
+            bridging_fallback_reason=statements.bridging_fallback_reason,
         )
 
     def _fallback_groups(
@@ -1397,12 +1418,14 @@ class TextMatchingService:
             TextMatchGroup(
                 participant_ids=group,
                 diversity_level="unknown",
-                diffusion_statement=statement,
+                diffusion_statement=statement.text,
                 fallback_used=True,
                 assigned_target=None,
                 achieved_diversity=None,
+                maximin_fallback_reason=statement.maximin_fallback_reason,
+                bridging_fallback_reason=statement.bridging_fallback_reason,
             )
-            for group, (statement, _) in zip(groups, statements)
+            for group, statement in zip(groups, statements)
         ]
 
 

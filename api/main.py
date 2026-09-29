@@ -443,10 +443,14 @@ def match(req: MatchRequest, request: Request):
                     "achievedDiversity": group.achieved_diversity,
                     "diffusionStatement": group.diffusion_statement,
                     "fallbackUsed": group.fallback_used,
+                    # Group-level failure only; why each statement fell back
+                    # is in the two fields below.
                     "fallbackReason": (
                         "participant_embedding_failed" if group.diversity_level == "unknown"
-                        else "diffusion_fallback_used" if group.fallback_used else None
+                        else None
                     ),
+                    "maximinFallbackReason": group.maximin_fallback_reason,
+                    "bridgingFallbackReason": group.bridging_fallback_reason,
                 }
                 for index, group in enumerate(groups)
             ],
